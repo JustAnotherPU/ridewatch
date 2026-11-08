@@ -2,7 +2,7 @@
   "id": "jap_ridewatch",
   "title": "RideWatch",
   "description": "RideWatch: your UniFi Protect cameras on the whole screen while parked: the camera that matters big (a ring, a person, the latest detection), the others beside it, a timeline of what happened with each event's clip, any camera alone. The stream comes from your RideWatch server and is decoded by the jap-ridewatch tool into the mgu-render video layer",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "vendor": "custom",
   "loggingId": "RWAT",
   "signals": {
@@ -699,7 +699,7 @@
     },
     {
       "key": "socks",
-      "label": "SOCKS5 proxy port on the head unit (jap-tailscale: 1065)",
+      "label": "SOCKS5 proxy port on the head unit (jap-wireproxy: 1065; IterioDev's Tailscale: 1055)",
       "type": "number",
       "default": 1065,
       "markDefault": true,
@@ -712,9 +712,11 @@
     },
     {
       "key": "socksFallback",
-      "label": "Second SOCKS5 proxy port, tried when the first fails (0: none)",
+      "label": "Second SOCKS5 proxy port, tried when the first fails (IterioDev's Tailscale: 1055; 0: none)",
       "type": "number",
-      "default": 0,
+      "default": 1055,
+      "markDefault": true,
+      "reset": 1,
       "steps": [
         0,
         1055,

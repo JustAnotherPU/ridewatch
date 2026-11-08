@@ -242,11 +242,15 @@ const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(J
     assert.ok(/^([A-HJ-NP-Z2-9]{4}-){3}[A-HJ-NP-Z2-9]{4}$/.test(made.token) && fs.statSync(CONF).mode & 0o777, 0o600);
     assert.strictEqual(fs.statSync(CONF).mode & 0o777, 0o600, 'server.json 0600');
     assert.ok(out.indexOf(made.token) < 0, 'the code is not logged');
-    // the app's settings: merged into server.json, the code kept; 0.0.0.0 keeps the address; nonsense refused
+    // the app's settings: merged into server.json, the code kept; 0.0.0.0 keeps the address; nonsense refused.
+    // Port 1055 is IterioDev's Tailscale, on 127.0.0.2; any other port is on 127.0.0.1
     k.send({ cmd: 'config', host: [192, 0, 2, 10], port: 18640, socks: port, socksFallback: 1055, lat: 51, lon: -2 });
     await until(() => JSON.parse(fs.readFileSync(CONF, 'utf8')).host === '192.0.2.10', 'config written');
     assert.deepStrictEqual(JSON.parse(fs.readFileSync(CONF, 'utf8')), { token: made.token, host: '192.0.2.10', port: 18640, socks: '127.0.0.1:' + port,
-        socksFallback: '127.0.0.1:1055', lat: 51, lon: -2 });
+        socksFallback: '127.0.0.2:1055', lat: 51, lon: -2 }, '1055 -> 127.0.0.2');
+    k.send({ cmd: 'config', host: [0, 0, 0, 0], port: 18640, socks: 1055, socksFallback: 1065, lat: 51, lon: -2 });
+    await until(() => JSON.parse(fs.readFileSync(CONF, 'utf8')).socks === '127.0.0.2:1055', 'socks 1055 -> 127.0.0.2');
+    assert.strictEqual(JSON.parse(fs.readFileSync(CONF, 'utf8')).socksFallback, '127.0.0.1:1065', '1065 -> 127.0.0.1');
     k.send({ cmd: 'config', host: [0, 0, 0, 0], port: 18640, socks: port, socksFallback: 0, lat: 0, lon: 0 });
     await until(() => !('socksFallback' in JSON.parse(fs.readFileSync(CONF, 'utf8'))), 'config again');
     assert.deepStrictEqual(JSON.parse(fs.readFileSync(CONF, 'utf8')), { token: made.token, host: '192.0.2.10', port: 18640, socks: '127.0.0.1:' + port });

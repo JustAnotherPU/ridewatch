@@ -3,10 +3,10 @@
 // Copyright (C) 2026 JustAnotherPU
 /**
  * ridewatchd.js - the jap-ridewatch service on the car (Node 22, jap-node22). Serves ctl.sock to the RideWatch app (Node 8),
- * fetches the H.264 stream from the RideWatch server through a local SOCKS5 proxy (the car has no TUN: a tunnel such
- * as Tailscale or WireGuard offers one on 127.0.0.1) and feeds it to camdec's stdin (camdec writes the MGVF frames
- * the app's layer shows). While an app is connected it also holds the server's event feed and picks the spot
- * view's hero camera.
+ * fetches the H.264 stream from the RideWatch server through a local SOCKS5 proxy (the car has no TUN: jap-wireproxy
+ * offers one on 127.0.0.1:1065, IterioDev's Tailscale on 127.0.0.2:1055) and feeds it to camdec's stdin (camdec
+ * writes the MGVF frames the app's layer shows). While an app is connected it also holds the server's event feed
+ * and picks the spot view's hero camera.
  *
  * Environment (defaults are the car's):
  *   JAP_RIDEWATCH_CONF   /var/opt/jap-ridewatch/state/server.json (0600), written here: {"host","port","socks":"127.0.0.1:1065",
@@ -125,6 +125,8 @@ function conf() {
     return { host: c.host, port: c.port, token: c.token, socksHost: sk[0], socksPort: +sk[1], fbHost: fb && fb[0], fbPort: fb && +fb[1],
         homeSsid: typeof c.homeSsid === 'string' ? c.homeSsid : null, lat: ll ? c.lat : null, lon: ll ? c.lon : null };
 }
+// IterioDev's Tailscale serves its SOCKS5 on 127.0.0.2 (port 1055 by convention); jap-wireproxy and the others on 127.0.0.1
+const socksAt = (port) => (port === 1055 ? '127.0.0.2:' : '127.0.0.1:') + port;
 /** {"cmd":"config"} from the app's settings: merged into server.json (the token and homeSsid stay). */
 function configure(m) {
     const n = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
@@ -133,8 +135,8 @@ function configure(m) {
     const c = readConf(), before = JSON.stringify(c), host = m.host.join('.');
     if (host !== '0.0.0.0') c.host = host;
     c.port = m.port;
-    c.socks = '127.0.0.1:' + m.socks;
-    if (m.socksFallback) c.socksFallback = '127.0.0.1:' + m.socksFallback; else delete c.socksFallback;
+    c.socks = socksAt(m.socks);
+    if (m.socksFallback) c.socksFallback = socksAt(m.socksFallback); else delete c.socksFallback;
     if (m.lat || m.lon) { c.lat = m.lat; c.lon = m.lon; } else { delete c.lat; delete c.lon; }
     if (JSON.stringify(c) === before) return;
     const moved = JSON.parse(before || '{}').host !== c.host || JSON.parse(before || '{}').port !== c.port;

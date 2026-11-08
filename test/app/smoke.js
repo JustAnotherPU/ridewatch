@@ -122,10 +122,10 @@ Module._load = function (req) {
     await until(() => d.cmds('status').length && d.cmds('list').length, 'status + list on connect');
     await until(() => r.hello && r.hello.indexOf('jap_ridewatch\0proto=mgu-render/1') === 0, 'native HELLO');
     // the settings go to the service first: defaults (no address yet), then again on a change
-    assert.deepStrictEqual(d.cmds('config')[0], { cmd: 'config', host: [0, 0, 0, 0], port: 18640, socks: 1065, socksFallback: 0, lat: 0, lon: 0 }, 'config on connect');
+    assert.deepStrictEqual(d.cmds('config')[0], { cmd: 'config', host: [0, 0, 0, 0], port: 18640, socks: 1065, socksFallback: 1055, lat: 0, lon: 0 }, 'config on connect: jap-wireproxy first, Tailscale second');
     settings.set('server1', 192); settings.set('server2', 0); settings.set('server3', 2); settings.set('server4', 10); settings.set('lat', 51);
     await until(() => d.cmds('config').length >= 5, 'config on every change');
-    assert.deepStrictEqual(d.cmds('config').slice(-1)[0], { cmd: 'config', host: [192, 0, 2, 10], port: 18640, socks: 1065, socksFallback: 0, lat: 51, lon: 0 });
+    assert.deepStrictEqual(d.cmds('config').slice(-1)[0], { cmd: 'config', host: [192, 0, 2, 10], port: 18640, socks: 1065, socksFallback: 1055, lat: 51, lon: 0 });
     const LABELS = ['Door', 'Garage', 'Yard', 'Drive', 'Street', 'Side', 'Garden', 'Patio 360', 'Shed', 'Porch', 'Attic'];
     d.send({ ev: 'state', state: 'idle', view: null, msg: null });
     d.send({ ev: 'list', cams: LABELS.map((label, i) => ({ i, name: 'Cam ' + i, label })) });

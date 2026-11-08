@@ -20,7 +20,7 @@ thumbnail per detection, and plays its clip from Protect.
 
 The car does not talk to Protect. A small server on your home network (any Linux machine with ffmpeg) reads the
 cameras over RTSPS, composes them into one H.264 stream at exactly the size of the car's screen, and keeps the list
-of detections. The car reaches that server through a tunnel, normally Tailscale.
+of detections. The car reaches that server through a tunnel: WireGuard to your own server, or Tailscale.
 
 ## Works with
 
@@ -42,9 +42,16 @@ of detections. The car reaches that server through a tunnel, normally Tailscale.
 - A UniFi Protect console (UniFi OS) with your cameras (for other cameras, see [Works with](#works-with)).
 - A Linux machine at home that stays on: Debian or Ubuntu with systemd, Python 3.7 or newer, ffmpeg with libx264.
   It encodes one 1920 x 720 stream per car, so give it a few CPU cores (a small x86 box or a VM is fine).
-- A way for the car to reach that machine. The usual one is Tailscale: the `jap-tailscale` tool from
-  [mgu-apps](https://github.com/JustAnotherPU/mgu-apps) gives the car a SOCKS5 proxy into your tailnet, and the
-  server machine is on the tailnet too (or behind a subnet router).
+- A way for the car to reach that machine. The service tries two local SOCKS5 proxies, in this order:
+  - `jap-wireproxy` from [mgu-apps](https://github.com/JustAnotherPU/mgu-apps), on port 1065. It is a client for
+    the WireGuard protocol, to a server you run yourself (a home router, a VPS) on the server machine's network.
+  - IterioDev's Tailscale (`iteriodev-tailscale`, from [IterioDev/car-apps](https://github.com/IterioDev/car-apps)),
+    on port 1055. Its SOCKS5 server is off until you turn it on, as root on the head unit:
+    `echo 1055 > /var/opt/iteriodev-tailscale/socks5-port && systemctl restart iteriodev-tailscale`. Sign it in
+    with IterioDev's Tailscale app, which shows the login QR code. The server machine is on the tailnet too (or
+    behind a subnet router).
+
+  One of them is enough. With both, Tailscale is the backup when WireGuard fails.
 
 ## Install the server
 
@@ -65,28 +72,31 @@ of detections. The car reaches that server through a tunnel, normally Tailscale.
 5. It writes `/opt/jap-ridewatch/cams.json` (mode 0600, readable by the service only) and starts the services: the
    stream on TCP port 18640 and the events service.
 
-`sudo bash server/install.sh 100.64.0.5` listens on that address only (for example the machine's Tailscale
-address) instead of every interface. Run `sudo python3 /opt/jap-ridewatch/configure.py` again whenever you add a
-camera or want to change the roles; Enter keeps each answer.
+`sudo bash server/install.sh 100.64.0.5` listens on that address only (for example the machine's Tailscale or
+WireGuard address) instead of every interface. Run `sudo python3 /opt/jap-ridewatch/configure.py` again whenever
+you add a camera or want to change the roles; Enter keeps each answer.
 
 Do not open port 18640 to the internet. The stream is not encrypted and the only check is the car's code (below):
-keep it on your LAN and your tailnet.
+keep it on your LAN and your tunnel.
 
 ## Install on the car
 
 1. In the MGU Store, open Sources and add `JustAnotherPU/ridewatch` on the Releases channel
    (`JustAnotherPU/ridewatch:releases`).
 2. Add `JustAnotherPU/mgu-apps:releases` too. It has Node.js 22 (`jap-node22`), which the RideWatch service runs on,
-   and Tailscale (`jap-tailscale`).
+   and wireproxy (`jap-wireproxy`).
 3. Install RideWatch. The Store installs the RideWatch service (`jap-ridewatch`) and Node.js 22 first, and
-   mgu-render if it is missing. Install Tailscale from mgu-apps as well, and sign it in (see the
-   [mgu-apps README](https://github.com/JustAnotherPU/mgu-apps#tailscale)).
-4. If the Store says a restart is pending, restart the head unit.
+   mgu-render if it is missing.
+4. Set up the tunnel (see [What you need](#what-you-need)). For `jap-wireproxy`, install it from mgu-apps and write
+   its configuration with `BindAddress = 127.0.0.1:1065` (see its
+   [README](https://github.com/JustAnotherPU/mgu-apps/tree/main/tools/jap-wireproxy)). For Tailscale, install
+   IterioDev's, turn on its SOCKS5 server on port 1055 and sign it in.
+5. If the Store says a restart is pending, restart the head unit.
 
 ## Pairing the car
 
 1. Open RideWatch, then its Settings. Set Server IP (four numbers) to the server machine's address as the car sees
-   it, for example its Tailscale address `100.x.y.z`.
+   it, for example its LAN address behind your WireGuard server, or its Tailscale address `100.x.y.z`.
 2. Back on the camera page, the app says the server refused this car and shows a code like `ABCD-EFGH-JKLM-NPQR`.
    The car made that code at its first start; it is kept on the head unit
    (`/var/opt/jap-ridewatch/state/server.json`, readable by the service only).
@@ -109,8 +119,8 @@ On the car (RideWatch, Settings):
 | Parked only | On by default. See [Driving](#driving). |
 | Server IP | The RideWatch server's IPv4 address. There is no default. |
 | Server port | 18640, the server's default. |
-| SOCKS5 proxy port | The local proxy the service connects through: 1065 is `jap-tailscale`'s. |
-| Second SOCKS5 proxy port | Tried when the first one fails (another tunnel, for example). 0: none. |
+| SOCKS5 proxy port | The local proxy the service connects through. 1065 (the default) is `jap-wireproxy`, on 127.0.0.1. |
+| Second SOCKS5 proxy port | Tried when the first one fails. 1055 (the default) is IterioDev's Tailscale, on 127.0.0.2. 0: none. |
 | Latitude, Longitude | Where the cameras are, to the nearest 5 degrees, east positive. Used only to switch to the night camera between sunset and sunrise. Both 0: always the day camera. |
 
 On the server (`/opt/jap-ridewatch/cams.json`, written by `configure.py`): the Protect address and user, the cameras
@@ -165,7 +175,8 @@ Warranty) and 16 (Limitation of Liability) of the GNU General Public License v3 
 ## Security
 
 - The stream between the server and the car is plain H.264 over TCP, and the car's code travels in clear in the
-  first line. Over Tailscale the whole link is encrypted; on any other network it is not.
+  first line. Inside the tunnel (WireGuard or Tailscale) it is encrypted. Past the tunnel's end, and on any other
+  network, it is not.
 - The server talks to the Protect console over HTTPS without checking its certificate (the console's own
   certificate is self-signed). Run the server on the same LAN as the console.
 - `cams.json` holds the Protect user's password. It is mode 0600 and owned by `japridewatch`; use a View Only user.
@@ -188,7 +199,7 @@ Warranty) and 16 (Limitation of Liability) of the GNU General Public License v3 
 
 ## Uninstall
 
-1. In the MGU Store, uninstall RideWatch, then the RideWatch service (`jap-ridewatch`). Node.js 22 and Tailscale
+1. In the MGU Store, uninstall RideWatch, then the RideWatch service (`jap-ridewatch`). Node.js 22 and the tunnel
    stay for other apps.
 2. On the server, remove the car's code (`configure.py --remove-car CODE`), or the whole server:
    `sudo systemctl disable --now jap-ridewatch.socket jap-ridewatch-events.service`, then

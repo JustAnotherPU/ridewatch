@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2
+
+- The tunnels: `jap-wireproxy` from mgu-apps first (SOCKS5 port 1065, on 127.0.0.1), IterioDev's Tailscale second
+  (port 1055, on 127.0.0.2). The second SOCKS5 proxy port is now 1055 by default, set once on cars that saved
+  another value. The service writes port 1055 as `127.0.0.2:1055` in `server.json` and any other port on
+  127.0.0.1; `server.json` keeps its `host:port` form.
+- `jap-tailscale` is no longer in mgu-apps: for Tailscale, use IterioDev's with its SOCKS5 server turned on
+  (README, "What you need").
+
 ## 0.3.1
 
 - Renamed to RideWatch: the app is `jap_ridewatch`, its service `jap-ridewatch`, and the server's user, folders and
