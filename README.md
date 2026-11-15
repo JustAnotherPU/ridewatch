@@ -81,9 +81,9 @@ keep it on your LAN and your tunnel.
 
 ## Install on the car
 
-1. In the MGU Store, open Sources and add `JustAnotherPU/ridewatch` on the Releases channel
-   (`JustAnotherPU/ridewatch:releases`).
-2. Add `JustAnotherPU/mgu-apps:releases` too. It has Node.js 22 (`jap-node22`), which the RideWatch service runs on,
+1. In the MGU Store, open Sources and add `JustAnotherPU/ridewatch` and pick the Releases channel.
+   Type only `owner/repo`: the Store refuses a `:releases` at the end.
+2. Add `JustAnotherPU/mgu-apps` on Releases too. It has Node.js 22 (`jap-node22`), which the RideWatch service runs on,
    and wireproxy (`jap-wireproxy`).
 3. Install RideWatch. The Store installs the RideWatch service (`jap-ridewatch`) and Node.js 22 first, and
    mgu-render if it is missing.
