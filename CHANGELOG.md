@@ -1,6 +1,6 @@
 # Changelog
 
-The Store still installs 0.3.4. Versions 0.4.0 to 0.5.5 are in the source only, until they have run on a car.
+The Store still installs 0.3.2. Versions 0.3.3 to 0.5.5 are in the source only, until 0.5.5 has run on a car.
 
 ## Unreleased (server 0.5.0, service tool 0.5.5)
 
