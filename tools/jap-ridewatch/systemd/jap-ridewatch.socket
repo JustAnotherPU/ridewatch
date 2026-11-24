@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=jap-ridewatch: the RideWatch app's control socket (root's; socklock.sh gives it to the app's uid alone)
+
+[Socket]
+# root makes the folder and a root:root 0600 socket; socklock.sh (jap-ridewatch-lock.service, and one pass at each
+# start of jap-ridewatch.service) hands it to the uid MainApp's registry gives jap_ridewatch: no other app connects.
+# jap-ridewatch.service gets it as fd 3.
+ListenStream=/run/jap-ridewatch/ctl.sock
+SocketMode=0600
+DirectoryMode=0755
+# Up to 0.3.2 the folder was the service's RuntimeDirectory (nobody's): root's again before the bind, which replaces
+# the old daemon's socket file.
+ExecStartPre=-/bin/sh -c 'd=/run/jap-ridewatch; [ -d $$d ] && [ ! -L $$d ] && chown 0:0 $$d && chmod 0755 $$d; true'
+# One pass of the lock as soon as it listens: after an update made while jap-ridewatch.service was stopped, the app's
+# connection is what starts it. At boot /var/opt may not be mounted yet: jap-ridewatch-lock.service follows.
+ExecStartPost=-/bin/sh -c 'f=/var/opt/jap-ridewatch/current/socklock.sh; [ -f $$f ] && SOCKLOCK_ONCE=1 exec /bin/sh $$f /run/jap-ridewatch/ctl.sock jap_ridewatch; true'
+
+[Install]
+WantedBy=sockets.target

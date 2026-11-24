@@ -2,27 +2,33 @@
 [Unit]
 Description=jap-ridewatch: UniFi Protect camera stream service (ctl socket for the RideWatch app; feeds the camdec decoder)
 RequiresMountsFor=/var/opt
-After=local-fs.target
+# ctl.sock is jap-ridewatch.socket's (root's, for the app's uid alone): passed as fd 3
+Requires=jap-ridewatch.socket
+After=local-fs.target jap-ridewatch.socket
 
 [Service]
-# nobody: mgu-render accepts frame files from the app uid, root or nobody (PROTOCOL.md "Video");
-# video = renderD128 for the MSDK; group tm_oap_app makes ctl.sock 0660 reachable by the app.
-User=nobody
-Group=tm_oap_app
-SupplementaryGroups=video
-# '+' runs as root: the deploy tool installs everything 0:0; nobody needs its own state dir and must own the
-# server.json put there (token: 0600)
-ExecStartPre=-+/bin/sh -c 'mkdir -p /var/opt/jap-ridewatch/state && chown nobody:tm_oap_app /var/opt/jap-ridewatch/state && chmod 0700 /var/opt/jap-ridewatch/state && if [ -f /var/opt/jap-ridewatch/state/server.json ]; then chown nobody /var/opt/jap-ridewatch/state/server.json && chmod 0600 /var/opt/jap-ridewatch/state/server.json; fi'
-# a frame file left by another owner (root, a test) makes camdec exit 2 as nobody (/dev/shm is sticky)
-ExecStartPre=-+/bin/sh -c '[ -e /dev/shm/mgu-video-ridewatch ] && [ "$(stat -c %%U /dev/shm/mgu-video-ridewatch)" != nobody ] && rm -f /dev/shm/mgu-video-ridewatch; true'
+# RideWatch's own uid 3911 (gid 3911, no account; not nobody, which other services share): this systemd (237) takes no
+# User= for a uid without an account, so the unit starts as root and ridewatchd.js drops to JAP_RIDEWATCH_RUNAS before
+# it reads anything. video = renderD128 for camdec's MSDK. The ExecStartPre lines run as root.
+Environment=JAP_RIDEWATCH_RUNAS=3911:3911:video
+# the deploy tool installs everything 0:0; the daemon needs its own state dir and must own the server.json put there
+# (token: 0600), and order.json (the heroes' order, since 0.4.x); a *.tmp a killed run left is removed. root locks state/ first (root:root 0700) so nothing can swap either for a link while root checks
+# it; only a plain file with one link is handed over; then state/ goes back to 3911 (from 0.5.0 and before: nobody's)
+ExecStartPre=-/bin/sh -c 'mkdir -p /var/opt/jap-ridewatch/state && chown root:root /var/opt/jap-ridewatch/state && chmod 0700 /var/opt/jap-ridewatch/state && for f in /var/opt/jap-ridewatch/state/server.json /var/opt/jap-ridewatch/state/order.json; do if [ -f $$f ] && [ ! -L $$f ] && [ "$$(stat -c %%h $$f)" = 1 ]; then chown 3911:3911 $$f && chmod 0600 $$f; fi; done; rm -f /var/opt/jap-ridewatch/state/server.json.tmp /var/opt/jap-ridewatch/state/order.json.tmp; chown 3911:3911 /var/opt/jap-ridewatch/state'
+# the frame file: mgu-render takes one owned by the app's uid, root or nobody (PROTOCOL.md "Video"), and camdec, as
+# 3911, cannot give its own to nobody. So root makes it root:3911 0660 here (a new file renamed over whatever is there,
+# a link or an empty directory there removed first) and camdec opens it as the group (tested: it stays root's, 0660).
+# No '-': if it is not 0:3911 660 afterwards the start fails, loudly, rather than a black picture
+ExecStartPre=/bin/sh -c 'if [ -L /dev/shm/mgu-video-ridewatch ]; then rm -f /dev/shm/mgu-video-ridewatch; elif [ -d /dev/shm/mgu-video-ridewatch ]; then rmdir /dev/shm/mgu-video-ridewatch; fi; t=$$(mktemp /dev/shm/.ridewatch.XXXXXX) && chown 0:3911 $$t && chmod 0660 $$t && mv -f $$t /dev/shm/mgu-video-ridewatch && [ "$$(stat -c %%u:%%g:%%a /dev/shm/mgu-video-ridewatch)" = 0:3911:660 ]'
 Environment=JAP_RIDEWATCH_CONF=/var/opt/jap-ridewatch/state/server.json
 Environment=JAP_RIDEWATCH_CTL=/run/jap-ridewatch/ctl.sock
 Environment=JAP_CAMDEC=/var/opt/jap-ridewatch/current/camdec
 Environment=JAP_RIDEWATCH_VIDEO=/dev/shm/mgu-video-ridewatch
+# one pass of the socket lock (root) before each start: after an update the app gets in at once, before
+# jap-ridewatch-lock.service runs (from the next boot, when recmgr has its entry)
+ExecStartPre=-/bin/sh -c 'SOCKLOCK_ONCE=1 exec /bin/sh /var/opt/jap-ridewatch/current/socklock.sh /run/jap-ridewatch/ctl.sock jap_ridewatch'
 ExecStart=/var/opt/jap-node22/current/bin/node /var/opt/jap-ridewatch/current/ridewatchd.js
-RuntimeDirectory=jap-ridewatch
-# 0755 like Moonride's: the socket itself is 0660, so only the app's group gets in
-RuntimeDirectoryMode=0755
+# no RuntimeDirectory=: /run/jap-ridewatch is jap-ridewatch.socket's (root's)
 # the daemon (~40 MB) + camdec (MSDK surfaces for one 1920x720 stream) + at most 4 MB held before an IDR;
 # CPU: the decode is the GPU's, the NV12->I420 copy and the pipe are ours (to measure on the car)
 MemoryLimit=256M

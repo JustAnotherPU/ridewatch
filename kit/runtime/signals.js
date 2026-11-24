@@ -13,6 +13,7 @@
  *       statusEngineSpeed2: (v) => rpm = v.actualValueRPMEngineCrankshaft,
  *   });
  *   sub.available  // true once the provider (the car) answers
+ *   sub.stop()     // unsubscribe, end the opts.pollMs re-read, shut the proxy down
  */
 const fs = require('fs');
 const path = require('path');
@@ -35,6 +36,9 @@ function nativeTick(fn) {
     return p;
 }
 
+// a teardown call that never settles must not hold up every later native call queued behind it
+const settled = (v) => Promise.race([Promise.resolve(v), new Promise((r) => setTimeout(r, 2000))]);
+
 function loadConfig(iface) {
     const f = iface.replace(/\./g, '_') + '.json';
     for (const d of DIRS) {
@@ -51,31 +55,41 @@ function loadConfig(iface) {
  * fields a car may not notify (BMW's x_call only ever reads TPMS, it never subscribes).
  */
 async function watch(iface, instance, handlers, log, opts) {
+    let stopped = false, timer = null, drop = () => Promise.resolve();
+    const ids = [];
     const res = { iface, available: false, proxy: null, error: null, shutdown: () => Promise.resolve() };
+    res.stop = () => {
+        stopped = true;
+        clearInterval(timer);
+        return Promise.all(ids.splice(0).map((id) => drop(id))).then(() => res.shutdown());
+    };
     if (!someip) { res.error = 'someip native module not available'; return res; }
     try {
         const cfg = loadConfig(iface);
         const p = await nativeTick(() => someip.buildProxy(cfg, String(instance)).then((px) => px.init().then(() => px)));
         res.proxy = p;
-        res.shutdown = () => Promise.resolve().then(() => p.shutdown && p.shutdown()).catch(() => {});
+        // in its own tick like buildProxy: stop() runs on every hide, often right before the next watch() builds a proxy
+        res.shutdown = () => nativeTick(() => settled(p.shutdown && p.shutdown())).catch(() => {});
+        drop = (id) => nativeTick(() => settled(p.unsubscribe && p.unsubscribe(id))).catch(() => {});
         const fields = Object.keys(handlers || {});
-        const fetchAll = () => fields.forEach((f) => {
+        const fetchAll = () => stopped || fields.forEach((f) => {
             if (cfg.fields && cfg.fields[f] && cfg.fields[f].getter) {
                 p.getValue(f, 3000).then((v) => handlers[f](v)).catch(() => {});
             }
         });
         await nativeTick(() => {
-            try { return p.subscribeToAvailability((a) => { res.available = !!a; if (a) setImmediate(fetchAll); }); } catch (e) { return null; /* older binding */ }
+            try { return p.subscribeToAvailability((a) => { res.available = !!a; if (a && !stopped) setImmediate(fetchAll); }); } catch (e) { return null; /* older binding */ }
         });
         for (const f of fields) {
             try {
-                await nativeTick(() => p.subscribe({ name: f, onReceive: (v) => { try { handlers[f](v); } catch (e) { if (log) log.warn(iface + '.' + f + ': ' + e); } } }));
+                const id = await nativeTick(() => p.subscribe({ name: f, onReceive: (v) => { try { handlers[f](v); } catch (e) { if (log) log.warn(iface + '.' + f + ': ' + e); } } }));
+                ids.push(id);
             } catch (e) {
                 if (log) log.warn('subscribe ' + iface + '.' + f + ': ' + e);
             }
         }
         if (p.isAvailable && p.isAvailable()) { res.available = true; fetchAll(); }
-        if (opts && opts.pollMs) setInterval(() => { if (res.available) setImmediate(fetchAll); }, opts.pollMs);
+        if (opts && opts.pollMs) timer = setInterval(() => { if (res.available) setImmediate(fetchAll); }, opts.pollMs);
     } catch (e) {
         res.error = String(e);
         if (log) log.warn('signals ' + iface + ': ' + e);

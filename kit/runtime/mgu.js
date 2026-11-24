@@ -122,7 +122,7 @@ class Settings {
         const s = this.item(key), v = this.values[key];
         if (!s) return String(v);
         if (s.type === 'choice') { const o = (s.options || []).find((x) => x[0] === v); return o ? o[1] : String(v); }
-        if (s.type === 'number') return String(v) + (s.unit ? ' ' + s.unit : '') + (s.markDefault && v === s.default ? ' (default)' : '');
+        if (s.type === 'number') return (s.labels && s.labels[String(v)] !== undefined ? s.labels[String(v)] : String(v) + (s.unit ? ' ' + s.unit : '')) + (s.markDefault && v === s.default ? ' (default)' : '');
         if (s.type === 'bool') return v ? 'On' : 'Off';
         return String(v);
     }
@@ -148,6 +148,8 @@ class Ui {
         this._visHandlers = [];
         this._focus = Object.create(null);    // stateName -> false while a popup covers it
         this._focusHandlers = [];
+        this._raised = [];                    // our screens, in the order they came to the front (topScreen)
+        this._topHandlers = [];
         this.timing = { png: 0, push: 0 };    // ms spent encoding / handing images to the HMI
         this._cnText = new HmiText();
     }
@@ -162,10 +164,10 @@ class Ui {
         return Promise.race([Promise.resolve(p), slow]).catch((e) => log.warn(what + ': ' + e)).then((v) => { clearTimeout(timer); return v; });
     }
 
-    text(name, text, row, cell) {
+    text(name, text, row, cell, options) {
         const c = this.comp(name);
         if (c && !row && (!cell || cell === 'Text') && this.display) this.display.label(name, text);   // slim bar mirrors it
-        return c ? this._try('text ' + name, this._cnText.set(c, name, row || 0, cell || 'Text', text)) : Promise.resolve();
+        return c ? this._try('text ' + name, this._cnText.set(c, name, row || 0, cell || 'Text', text, options)) : Promise.resolve();
     }
     /** Set several cells of one row: ui.cells('LIST', 3, { Text1stCol: 'a', Text2ndCol: 'b' }) */
     cells(name, row, obj) {
@@ -193,7 +195,26 @@ class Ui {
         const c = this.comp(name);
         if (c) c.on('action', (ev) => { log.info('click ' + name); Promise.resolve().then(() => fn(ev || {})).catch((e) => log.error('click ' + name, e)); });
     }
-    open(stateName) { return this._try('open ' + stateName, this.rhmi.openState(stateName)); }
+    open(stateName) { this._raise(stateName); return this._try('open ' + stateName, this.rhmi.openState(stateName)); }
+    /**
+     * Which of our screens is in front: the visible one raised last. The HMI's stack is no help here: it keeps
+     * a screen listed (so visible) while another of ours covers it, e.g. a menu opened from a drawn page.
+     * null when none of the visible ones was ever raised (nothing known: no screen is held back).
+     */
+    topScreen() {
+        for (let i = this._raised.length - 1; i >= 0; i--) if (this.isVisible(this._raised[i])) return this._raised[i];
+        return null;
+    }
+    onTop(fn) { this._topHandlers.push(fn); }
+    _raise(stateName) {
+        const was = this.topScreen();
+        this._raised = this._raised.filter((n) => n !== stateName).concat([stateName]);
+        this._topChanged(was);
+    }
+    _topChanged(was) {
+        const now = this.topScreen();
+        if (now !== was) this._topHandlers.forEach((fn) => { try { fn(now); } catch (e) { log.error(e); } });
+    }
     close(stateName) { return this._try('close ' + stateName, this.rhmi.closeState(stateName)); }
     isVisible(stateName) { return !!this._visible[stateName]; }
     /** false while an HMI popup covers the (visible) screen */
@@ -210,11 +231,13 @@ class Ui {
     onVisible(fn) { this._visHandlers.push(fn); }
     _setVisible(stateName, on) {
         if (this._visible[stateName] === on) return;
+        const was = this.topScreen();
         this._visible[stateName] = on;
         if (on) this._focus[stateName] = true;
         if (on) Object.keys(this._img).forEach((k) => { this._img[k].lastPx = null; });      // push the next frame for sure
         log.debug('state ' + stateName + (on ? ' visible' : ' hidden'));
         this._visHandlers.forEach((fn) => { try { fn(stateName, on); } catch (e) { log.error(e); } });
+        this._topChanged(was);
     }
 
     /**
@@ -534,6 +557,16 @@ async function runInner(impl) {
         signals: require('./signals'),
         theme: () => themes.theme(settings.get('theme')),
         /**
+         * hmiLanguage(fn): the car's HMI language ("ru_RU", "en_GB": the SDK's CurrentVehicleUnits, the same source
+         * that picks the string table the HMI shows), null when unknown; fn(lang) when it changes.
+         */
+        hmiLanguage(fn) {
+            const u = app.currentVehicleUnits;
+            if (!u || typeof u.getLanguage !== 'function') return null;
+            if (fn && typeof u.on === 'function') u.on('languageChanged', () => { try { fn(u.getLanguage()); } catch (e) { log.error('language', e); } });
+            try { return u.getLanguage() || null; } catch (e) { return null; }
+        },
+        /**
          * controller.grab(true): the iDrive controller's knob, press and tilt go to this app only
          * (the HMI stops moving its focus or opening its menus); BACK, MENU and the touchscreen
          * still work. Read the controller with signals (FrontCCU). Only while shown; release with
@@ -574,6 +607,10 @@ async function runInner(impl) {
          * the list with the bar in the colour of the selection (no frame round the page).
          */
         onScroll(fn) { display.onScroll = fn; },
+        /** scroll(dy): move what the page shows by dy px (+ = further down: a sheet's list, else a cv.scroll page), as a finger would; false when nothing moved (the controller's touchpad: touchpad.js). */
+        scroll(dy) { return display.scrollPage(dy); },
+        /** pointer.move(dx, dy) / pointer.tap(): the touchpad's pointer (display.js pointerMove); tap() is false when it is on nothing. */
+        pointer: { move(dx, dy) { display.pointerMove(dx, dy); }, tap() { return display.pointerTap(); } },
         /** onSwipe(fn): fn(dx) on a finger dragged sideways over the page where the kit runs the screen (+ = the finger went left, logical px); true when the page moved. A drag is no tap. */
         onSwipe(fn) { display.onSwipe = fn; },
         /**
@@ -643,7 +680,7 @@ async function runInner(impl) {
     const tracked = (SPEC.screens || []).concat(SPEC.settings && SPEC.settings.length ? [{ name: 'SETTINGS' }] : []);
     tracked.forEach((s) => {
         const st = ui.comp(s.name);
-        if (st && st.on) st.on('visible', (ev) => ui._setVisible(s.name, !!(ev && ev.visible)));
+        if (st && st.on) st.on('visible', (ev) => { if (ev && ev.visible) ui._raise(s.name); ui._setVisible(s.name, !!(ev && ev.visible)); });
         // a popup over the screen (options, warnings, calls) takes its focus: the display hides
         // the GPU overlay meanwhile, so the popup is never covered
         if (st && st.on) st.on('focus', (ev) => ui._setFocus(s.name, !(ev && ev.focus === false)));
@@ -687,17 +724,28 @@ async function runInner(impl) {
         .then(() => { mapped[uuid] = true; log.info('mapped entry ' + uuid + ' -> ' + mainName); })
         .catch((e) => log.error('map entry state', e))));
     let opening = null;
-    const openEntry = (uuid) => {
+    // tries: right after a tap started the app the HMI can still refuse the state (INVALID_UUID /
+    // INVALID_COMPONENTID) - then it is asked again, 0.8 s apart, instead of needing a second tap
+    const openEntry = (uuid, tries) => {
         if (opening) return opening;   // MainApp can send the same tap twice
+        let again = false;
         const map = mapped[uuid] ? Promise.resolve() : ui.rhmi.mapEntryState(uuid, mainState).then(() => { mapped[uuid] = true; });
         opening = map
             .then(() => (mainState && mainState.updateResources ? mainState.updateResources().catch(() => {}) : null))
             .then(() => ui.rhmi.openEntryState(uuid))
-            .then(() => ui._setVisible(mainName, true))
-            .catch((e) => log.error('open entry state', e))
-            .then(() => { opening = null; });
+            .then(() => { ui._raise(mainName); ui._setVisible(mainName, true); })
+            .catch((e) => {
+                if ((tries || 1) > 1 && /INVALID/.test(String(e && e.message ? e.message : e) + ' ' + JSON.stringify(e || {}))) again = true;
+                else log.error('open entry state', e);
+            })
+            .then(() => {
+                opening = null;
+                if (again) setTimeout(() => openEntry(uuid, tries - 1), 800);
+            });
         return opening;
     };
+    /** front(): bring the app's main screen to the front, as a tile tap does (for an app's own event, e.g. a doorbell). */
+    ctx.front = () => (entryUuids[0] ? openEntry(entryUuids[0]) : Promise.resolve());
     // a tap on the home-screen widget opens the app
     widget.onTap(() => { if (entryUuids[0]) openEntry(entryUuids[0]); });
     app.on('entryPointExecute', (uuid, reason, name) => {
@@ -714,13 +762,13 @@ async function runInner(impl) {
             new Promise((res) => { timer = setTimeout(() => { log.warn(what + ' still pending after ' + ms + ' ms, continuing'); res(); }, ms); }),
         ]).catch((e) => log.error(what, e)).then(() => clearTimeout(timer));
     };
-    // push every screen's rows to the HMI once (BMW apps do this via
-    // updateResources before opening a state); until then the HMI has no rows
-    // and lists render empty
+    // push every screen's and pop-up's rows to the HMI once (BMW apps do this via
+    // updateResources before opening a state); until then the HMI has no rows,
+    // lists render empty and a pop-up opens blank (its text update: INVALID_MODELID)
     // (menu screens only: doing it on a canvas screen before its first image
     // makes every later createResourceHandles fail with INVALID_VALUE)
     await step('screen resources', Promise.all((SPEC.screens || []).filter((s) => s.kind !== 'canvas')
-        .concat(SPEC.settings && SPEC.settings.length ? [{ name: 'SETTINGS' }] : [])
+        .concat(SPEC.settings && SPEC.settings.length ? [{ name: 'SETTINGS' }] : [], SPEC.popups || [])
         .map((s) => ui.comp(s.name)).filter((st) => st && st.updateResources)
         .map((st) => st.updateResources())), 4000);
     await step('settings screen', wireSettings(ctx), 3000);
@@ -730,7 +778,7 @@ async function runInner(impl) {
     // launched by a tile tap / bookmark: the execute event came before we
     // listened, so open the screen ourselves (M Laptimer does the same)
     const lastEntry = app.getLastExecutedEntryPointUuid && app.getLastExecutedEntryPointUuid();
-    if (lastEntry && ['ENTRY_POINT', 'BOOKMARK', 'LUM'].indexOf(String(app.startReason)) >= 0) openEntry(lastEntry);
+    if (lastEntry && ['ENTRY_POINT', 'BOOKMARK', 'LUM'].indexOf(String(app.startReason)) >= 0) openEntry(lastEntry, 6);
     process.on('unhandledRejection', (e) => log.error('unhandled', e));
     return ctx;
 }

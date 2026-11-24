@@ -11,6 +11,7 @@ StandardOutput=socket
 StandardError=journal
 User=japridewatch
 StateDirectory=jap-ridewatch
+StateDirectoryMode=0700
 Nice=5
 # leave room for the rest of the machine: at most 6 cores and 1 GiB per stream (a mosaic of 11 cameras: ~1.2 cores)
 CPUQuota=600%

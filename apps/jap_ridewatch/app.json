@@ -2,12 +2,20 @@
   "id": "jap_ridewatch",
   "title": "RideWatch",
   "description": "RideWatch: your UniFi Protect cameras on the whole screen while parked: the camera that matters big (a ring, a person, the latest detection), the others beside it, a timeline of what happened with each event's clip, any camera alone. The stream comes from your RideWatch server and is decoded by the jap-ridewatch tool into the mgu-render video layer",
-  "version": "0.3.2",
+  "version": "0.5.5",
   "vendor": "custom",
   "loggingId": "RWAT",
+  "startType": "autostart",
   "signals": {
     "de.bmw.infotainment.vehicle.Vehicle2": {
       "statusCarSpeed2": "rs"
+    },
+    "de.bmw.infotainment.controlelements.FrontCCU": {
+      "ccsControlTouchCCU": "w",
+      "_optional": "touch mode on the controller's touchpad while RideWatch shows (the pointer, two fingers scroll)"
+    },
+    "de.bmw.infotainment.ControllerElements": {
+      "ZBETouchFrontSide": "rs"
     }
   },
   "screens": [
@@ -35,7 +43,7 @@
   "settings": [
     {
       "key": "parkedOnly",
-      "label": "Parked only (stops the picture above 3 km/h). Off = cameras while driving, AT YOUR OWN RISK: passengers only, the driver must never watch",
+      "label": "Parked only (stops the picture above 3 km/h). Off = cameras while driving, AT YOUR OWN RISK: passengers only, the driver must never watch; takes effect once agreed to and parked",
       "type": "bool",
       "default": true
     },
@@ -852,6 +860,55 @@
       ]
     },
     {
+      "key": "alertRing",
+      "label": "Doorbell pop-up over any app when it rings (never while driving)",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "alertPerson",
+      "label": "Pop-up for a person seen (never while driving)",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "alertVehicle",
+      "label": "Pop-up for a vehicle seen (never while driving)",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "alertPackage",
+      "label": "Pop-up for a package seen (never while driving)",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "alertAnimal",
+      "label": "Pop-up for an animal seen (never while driving)",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "alertCooldown",
+      "label": "Time between two pop-ups of the same kind from the same camera (person, vehicle, package, animal)",
+      "type": "number",
+      "default": 5,
+      "unit": "min",
+      "markDefault": true,
+      "steps": [
+        1,
+        5,
+        15
+      ]
+    },
+    {
+      "key": "french",
+      "label": "Pop-ups and doorbell buttons in French (Français; the rest stays in English)",
+      "type": "bool",
+      "default": false
+    },
+    {
       "key": "theme",
       "label": "Highlight colour",
       "type": "choice",
@@ -863,6 +920,15 @@
         ]
       ],
       "hidden": true
+    }
+  ],
+  "popups": [
+    {
+      "name": "RING",
+      "type": "popUp",
+      "widget": "LT_State_PopupSmall",
+      "label": "text3",
+      "button": "View"
     }
   ],
   "license": "GPL-3.0-or-later"

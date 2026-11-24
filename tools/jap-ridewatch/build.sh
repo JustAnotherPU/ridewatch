@@ -11,13 +11,18 @@ store=${MGU_STORE:?set MGU_STORE to a checkout of github.com/robertnisipeanu/mgu
 bin=${CAMDEC:-$root/native/camdec/build/target/camdec}
 file -L "$bin" | grep -q 'ELF 64-bit.*x86-64' || { echo "build.sh: $bin is not an x86-64 ELF (make -C native/camdec target first)" >&2; exit 1; }
 rm -rf "$here/build"
-mkdir -p "$here/build/vendor/jpeg-js" "$here/build/licenses"
+mkdir -p "$here/build/vendor/jpeg-js" "$here/build/licenses" "$here/build/audio/defs"
 cp "$bin" "$here/build/camdec"
 cp "$root/daemon/ridewatchd.js" "$root/daemon/socks.js" "$here/build/"
 cp "$root/daemon/vendor/jpeg-js/decoder.js" "$root/daemon/vendor/jpeg-js/LICENSE" "$root/daemon/vendor/jpeg-js/Apache-2.0.txt" "$here/build/vendor/jpeg-js/"
+cp "$root/audio/ridewatch-audio.js" "$root/audio/audio.json" "$here/build/audio/"
+cp "$root/audio/defs/"*.json "$here/build/audio/defs/"
 cp "$root/LICENSE" "$here/build/LICENSE"
 cp "$root/THIRD_PARTY_LICENSES/intel-mediasdk-headers.LICENSE" "$here/build/licenses/"
 node --check "$here/build/ridewatchd.js"
 node --check "$here/build/socks.js"
+node --check "$here/build/audio/ridewatch-audio.js"
+for j in "$here/build/audio/audio.json" "$here/build/audio/defs/"*.json; do node -e "JSON.parse(require('fs').readFileSync(process.argv[1]))" "$j"; done
+(cd "$here/build/audio" && node -e "require('./ridewatch-audio.js')")   # loads without listening
 (cd "$here/build" && node -e "require('./ridewatchd.js')")      # loads (socks, jpeg-js) without starting
 node "$store/deploy/hu" artifact "$here" --out "$root/dist"

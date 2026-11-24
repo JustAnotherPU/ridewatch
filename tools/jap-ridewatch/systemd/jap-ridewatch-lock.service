@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=jap-ridewatch-lock: keeps /run/jap-ridewatch/ctl.sock the RideWatch app's alone (root, socklock.sh)
+RequiresMountsFor=/var/opt
+# Wants=, not BindsTo=/Requires=: a stop or restart of the socket never leaves the lock stopped (it waits for the
+# socket file itself)
+Wants=jap-ridewatch.socket
+After=jap-ridewatch.socket
+
+[Service]
+# root: chown of the socket to the app's uid, read from MainApp's registry every 30 s (socklock.sh says how it is
+# trusted); a registry it cannot trust keeps the owner, never shared
+ExecStart=/bin/sh /var/opt/jap-ridewatch/current/socklock.sh /run/jap-ridewatch/ctl.sock jap_ridewatch
+Restart=always
+# 3 s keeps clear of systemd's 5-starts-in-10-s limit.
+RestartSec=3
+LimitCORE=1
+
+[Install]
+WantedBy=multi-user.target

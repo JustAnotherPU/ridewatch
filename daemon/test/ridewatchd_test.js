@@ -1,9 +1,10 @@
 'use strict';
+process.env.JAP_RIDEWATCH_TEST_AS_ROOT = '1';   // these run as root in Docker; the daemon refuses root without it
 // jap-ridewatch daemon offline test: a fake SOCKS5 + RideWatch server (serve.py's protocol, mosaic2's layout line, a few bytes of
 // fake Annex-B) and a fake camdec (test/fake_camdec.js). Covers list, view, switch, drop + reconnect, last client gone,
 // and concept A: the event feed, the hero (chooseHero, isNight), spot streams following the hero, pick, ring, thumbs,
-// an event's clip (played once -> ended, never reconnected; a server error -> its message), the app's config and
-// the car's code.
+// an event's clip (played once -> ended, never reconnected; a server error -> its message), the app's config,
+// the car's code, the frame watchdog, the server's hello (an older server: proto 1) and the event feed's redials.
 //   node test/ridewatchd_test.js            (Node 22 like the car: docker run --rm --network none -v $PWD:/w -w /w node:22.12.0-alpine node test/ridewatchd_test.js)
 const assert = require('assert');
 const cp = require('child_process');
@@ -13,7 +14,7 @@ const os = require('os');
 const path = require('path');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ridewatchd-'));
-const CTL = path.join(tmp, 'ctl.sock'), CONF = path.join(tmp, 'server.json'), DLOG = path.join(tmp, 'camdec.log');
+const CTL = path.join(tmp, 'ctl.sock'), CONF = path.join(tmp, 'server.json'), DLOG = path.join(tmp, 'camdec.log'), STUCK = path.join(tmp, 'stuck');
 const TOKEN = 'tok-' + Math.random().toString(36).slice(2);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(fn, what, ms) { const end = Date.now() + (ms || 5000); while (!fn()) { if (Date.now() > end) throw new Error('timed out: ' + what); await sleep(10); } }
@@ -37,7 +38,8 @@ function stream(s, tag, conn) {
     let seq = 0;
     // one frame each 40 ms, each write cut in two at a random byte (TCP chunking anywhere)
     const put = (b) => { const k = 1 + Math.floor(Math.random() * (b.length - 1)); s.write(b.slice(0, k)); s.write(b.slice(k)); };
-    const gop = () => { put(nalu(0x67, tag, seq++, 20)); put(nalu(0x68, tag, seq++, 8)); put(nalu(0x65, tag, seq++, 3000)); };
+    // (the PPS 20 bytes too: room for a long stream's seq in its tag)
+    const gop = () => { put(nalu(0x67, tag, seq++, 20)); put(nalu(0x68, tag, seq++, 20)); put(nalu(0x65, tag, seq++, 3000)); };
     const t0 = setTimeout(() => {
         if (s.destroyed) return;
         conn.idrAt = Date.now();
@@ -57,7 +59,9 @@ const server = net.createServer((s) => {
         if (st === 0 && buf.length >= 3) { assert.deepStrictEqual([...buf.slice(0, 3)], [5, 1, 0]); buf = buf.slice(3); s.write(Buffer.from([5, 0])); st = 1; }
         if (st === 1 && buf.length >= 10) {
             assert.deepStrictEqual([...buf.slice(0, 10)], [5, 1, 0, 1, 192, 0, 2, 10, 18640 >> 8, 18640 & 255], 'SOCKS CONNECT to the server');
-            buf = buf.slice(10); s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0])); st = 2;
+            // badNext: a bad line in the same write as the SOCKS reply (the daemon gets it as the connect's `rest`)
+            buf = buf.slice(10); s.write(Buffer.concat([Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]), Buffer.from(srv.badNext ? 'null\n' : '')])); st = 2;
+            srv.badNext = false;
         }
         const k = st === 2 ? buf.indexOf(10) : -1;
         if (k < 0) return;
@@ -67,6 +71,7 @@ const server = net.createServer((s) => {
         const video = /^(mosaic2|cam|spot|clip)$/.test(w[1]);
         if (w[0] !== TOKEN || (video && srv.refuse > 0)) { if (video && srv.refuse > 0) srv.refuse--; return s.end(); }   // serve.py: close without a word
         if (w[1] === 'list') return s.end(JSON.stringify(CAMS) + '\n');
+        if (w[1] === 'hello') return s.end(srv.hello ? JSON.stringify(srv.hello) + '\n' : '');   // an older server: nothing
         if (w[1] === 'events') { srv.evs.push(s); return s.write(JSON.stringify({ ev: 'events', list: srv.events }) + '\n'); }
         if (w[1] === 'thumb') { srv.thumbs = (srv.thumbs || 0) + 1; return s.end(w[2] === 'e-jpeg' ? JPEG : Buffer.alloc(0)); }
         if (w[1] === 'spot') { const l = JSON.stringify(SPOT(+w[2])); s.write(l.slice(0, 33)); s.write(l.slice(33) + '\n'); return stream(s, 'S' + w[2], conn); }
@@ -88,7 +93,7 @@ let daemon, out = '';
 function startDaemon(port) {
     daemon = cp.spawn(process.execPath, [path.join(__dirname, '..', 'ridewatchd.js')], {
         env: Object.assign({}, process.env, { JAP_RIDEWATCH_CONF: CONF, JAP_RIDEWATCH_CTL: CTL, JAP_CAMDEC: path.join(__dirname, 'fake_camdec.js'),
-            JAP_RIDEWATCH_VIDEO: path.join(tmp, 'mgu-video-ridewatch'), MGU_UPLINK: path.join(tmp, 'status.json'), FAKE_CAMDEC_LOG: DLOG, FAKE_STATS_MS: '300' }),
+            JAP_RIDEWATCH_VIDEO: path.join(tmp, 'mgu-video-ridewatch'), MGU_UPLINK: path.join(tmp, 'status.json'), FAKE_CAMDEC_LOG: DLOG, FAKE_STATS_MS: '300', FAKE_CAMDEC_STUCK: STUCK }),
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     daemon.stdout.on('data', (d) => { out += d; });
@@ -107,6 +112,7 @@ function app() {
 const nals = () => (fs.existsSync(DLOG) ? fs.readFileSync(DLOG, 'utf8').trim().split('\n').map((l) => l.split(' ')) : []);
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return false; } };
 const streams = () => srv.conns.filter((c) => /^(mosaic2|cam|spot|clip) /.test(c.req || ''));
+const reqs = (req) => srv.conns.filter((c) => c.req === req);
 const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(JSON.stringify(Object.assign({ ev: 'event' }, e)) + '\n'));
 
 (async () => {
@@ -129,6 +135,16 @@ const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(J
     assert.deepStrictEqual(a.of('list')[0].cams[0], CAMS[0], 'list: shape and size passed on');
     assert.strictEqual(fs.statSync(CONF).mode & 0o777, 0o600, 'server.json made 0600');
     console.log('ok list');
+
+    // hello: the fake is an older server (it closes on hello without a word): after a list that worked, proto 1, no offset
+    await until(() => a.of('hello').length, 'hello after the list');
+    assert.deepStrictEqual(a.of('hello').slice(-1)[0], { ev: 'hello', daemon: '0.5.4', proto: 1, caps: [], tz: null, audio: [] });
+    a.send({ cmd: 'hello', app: '0.4.0' });
+    await until(() => a.of('hello').length === 2, 'hello to the app');
+    assert.deepStrictEqual(a.of('hello')[1], a.of('hello')[0]);
+    assert.strictEqual(reqs('hello').length, 1, 'asked once for this server and code');
+    assert.deepStrictEqual(a.of('error'), [], 'no error for an older server');
+    console.log('ok hello (older server: proto 1)');
 
     // view mosaic: mosaic2, the layout line, connecting -> playing, camdec gets the stream from its SPS, stats + kbps
     a.send({ cmd: 'view', view: 'mosaic', rect: '1920x720' });
@@ -184,6 +200,11 @@ const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(J
     const ev = a.evs.slice(k0).filter((e) => e.ev === 'state');
     assert.ok(/connection lost - retry in 1 s/.test(ev[0].msg) && ev[0].state === 'error', JSON.stringify(ev[0]));
     assert.ok(ev.some((e) => e.state === 'error' && e.msg === 'Server refused this car: add code ' + TOKEN + ' on the server - retry in 2 s'), 'refused message');
+    // the QR's link rides on the refused state and the connecting one after it; gone once playing (or another error)
+    const ri = ev.findIndex((e) => e.pair);
+    assert.ok(ri > 0 && ev[ri].state === 'error' && ev[ri].code === TOKEN && /^[0-9A-F]{4} [0-9A-F]{2}$/.test(ev[ri].fp) && !('n' in ev[ri]), 'refused: pair, fp, code ' + JSON.stringify(ev[ri]));
+    assert.ok(ev[ri + 1].state === 'connecting' && ev[ri + 1].pair === ev[ri].pair, 'connecting between retries keeps the QR');
+    assert.ok(!ev[0].pair && !ev.slice(-1)[0].pair && ev.slice(-1)[0].state === 'playing', 'no pair for a drop, none once playing');
     assert.ok(nals().every((l) => +l[0] === pid), 'camdec kept through the drop (its last frame stays)');
     console.log('ok drop + reconnect (' + (r1.open - tDrop) + ' ms, then ' + (r2.open - r1.open) + ' ms)');
 
@@ -197,16 +218,26 @@ const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(J
     assert.strictEqual(streams().length, 4, 'nothing reconnects after the stop');
 
     // a wrong token: refused, said so, the token never in the log
-    fs.writeFileSync(CONF, JSON.stringify({ host: '192.0.2.10', port: 18640, token: 'nope', socks: '127.0.0.1:' + port }), { mode: 0o600 });
+    const CODE = 'ABCD-EFGH-JKLM-NPQR';
+    fs.writeFileSync(CONF, JSON.stringify({ host: '192.0.2.10', port: 18640, token: CODE, socks: '127.0.0.1:' + port }), { mode: 0o600 });
     const b = app();
     await new Promise((r) => b.s.on('connect', r));
+    const nh = reqs('hello').length;
     b.send({ cmd: 'list' });
     await until(() => b.of('error').length, 'list error');
     assert.deepStrictEqual(b.of('error')[0], { ev: 'error', cmd: 'list', msg: 'server refused this car' });
+    assert.strictEqual(reqs('hello').length, nh, 'a refused car: no hello, so never taken for an older server');
     b.send({ cmd: 'view', view: 7, rect: '1921x720' });
     await until(() => b.of('error').length === 2, 'bad rect refused');
+    // a view refused: the setup page's link for the QR, the code's SHA-256 (printf %s CODE | shasum -a 256), its fingerprint
+    b.send({ cmd: 'view', view: 7, rect: '1920x720' });
+    await until(() => b.evs.some((e) => e.ev === 'state' && e.pair), 'refused view: pair');
+    assert.deepStrictEqual(b.evs.filter((e) => e.ev === 'state' && e.pair).map((e) => [e.pair, e.fp, e.code])[0],
+        ['https://192.0.2.10:18642/pair#h=2356329028e8ba9d57b3f7b33fef1b1f6d35dc228c095c4959bb873738fc2f3c', '2356 32', CODE]);
+    b.send({ cmd: 'status' });
+    await until(() => b.evs.filter((e) => e.ev === 'state' && e.pair).length >= 2, 'status repeats the pair');
     b.s.destroy();
-    assert.ok(out.indexOf(TOKEN) < 0 && out.indexOf('nope') < 0, 'token never logged');
+    assert.ok(out.indexOf(TOKEN) < 0 && out.indexOf(CODE) < 0 && out.indexOf('2356329028e8') < 0, 'token never logged (nor its hash)');
     console.log('ok bad token / bad rect; token not in the log');
 
     // socksFallback: the main SOCKS port is dead (that tunnel is down): the list still comes through the fallback
@@ -437,7 +468,8 @@ const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(J
     console.log('ok last client gone: event feed and spot closed');
     assert.ok(out.indexOf(TOKEN) < 0, 'token never logged (concept A part too)');
 
-    // a restart (a car sleep) keeps the order
+    // a restart (a car sleep) keeps the order; the server is now a v2 one (its hello)
+    srv.hello = { ev: 'hello', proto: 2, server: '0.4.0', tz: 345, caps: [] };
     daemon.kill('SIGTERM');
     await new Promise((r) => daemon.on('exit', r));
     startDaemon();
@@ -449,8 +481,75 @@ const push = (e) => srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(J
     await until(() => e2.of('hero').length, 'hero after restart');
     e2.send({ cmd: 'view', view: 'spot', rect: '1920x720' });
     await until(() => /^spot \d+ o=0,1,3,2,4,5,6,7,8,9,10 1920x720$/.test(streams().slice(-1)[0].req), 'order kept across a restart');
-    e2.s.destroy();
     console.log('ok order kept across a restart');
+
+    // hello from a v2 server: proto, caps and its offset to the app; a ping with another offset (DST) follows
+    await until(() => e2.of('hello').length, 'hello after the restart');
+    assert.deepStrictEqual(e2.of('hello').slice(-1)[0], { ev: 'hello', daemon: '0.5.4', proto: 2, caps: [], tz: 345, audio: [] });
+    srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(JSON.stringify({ ev: 'ping', tz: 405 }) + '\n'));
+    await until(() => e2.of('hello').slice(-1)[0].tz === 405, 'the ping\'s offset');
+    srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write(JSON.stringify({ ev: 'ping', tz: 'x' }) + '\n' + JSON.stringify({ ev: 'ping', tz: 9999 }) + '\n'));
+    await sleep(200);
+    assert.strictEqual(e2.of('hello').slice(-1)[0].tz, 405, 'a bad offset is ignored');
+    console.log('ok hello (v2 server: proto 2, tz 345, then 405 from a ping)');
+
+    // the event feed: a line that throws (`null`) closes it and it is dialed again, also when that line came in the
+    // same packet as the SOCKS reply (before any handler: the feed used to stay dead); then live events come again
+    const feeds = () => reqs('events').length;
+    let nf = feeds();
+    srv.evs.filter((s) => !s.destroyed).forEach((s) => s.write('null\n'));
+    await until(() => feeds() === nf + 1, 'redial after a bad line', 4000);
+    await until(() => srv.evs.filter((s) => !s.destroyed).length === 1, 'one feed');
+    nf = feeds(); srv.badNext = true;
+    srv.evs.filter((s) => !s.destroyed).forEach((s) => s.destroy());
+    await until(() => feeds() === nf + 1, 'redial after the drop', 4000);
+    await until(() => feeds() === nf + 2, 'redial after a bad line in the connect\'s rest', 6000);
+    await until(() => srv.evs.filter((s) => !s.destroyed).length === 1, 'one feed again');
+    push({ id: 'e-after', cam: 2, label: 'Yard', type: 'animal', ts: Date.now(), count: 1, thumb: false });
+    await until(() => e2.of('event').some((x) => x.id === 'e-after'), 'live events after the redials');
+    assert.ok(/events: bad line/.test(out), 'the bad line is logged');
+    console.log('ok event feed (a bad line: closed and dialed again, also in the connect\'s rest)');
+
+    // hidden: the feed's redial waits longer (10 s first, up to 5 min); shown again (a view): dialed at once
+    e2.send({ cmd: 'stop', why: 'hidden' });
+    await until(() => e2.states().slice(-1)[0] === 'idle', 'stopped (hidden)');
+    nf = feeds();
+    srv.evs.filter((s) => !s.destroyed).forEach((s) => s.destroy());
+    await sleep(3000);
+    assert.strictEqual(feeds(), nf, 'hidden: no redial within 3 s');
+    e2.send({ cmd: 'view', view: 'spot', rect: '1920x720' });
+    await until(() => feeds() === nf + 1, 'shown again: the feed at once', 1500);
+    console.log('ok hidden backoff (no redial in 3 s while hidden, at once when shown)');
+
+    // the frame watchdog: camdec's `shown` flat ~5 s while the bytes still come -> the stream fails and reconnects on
+    // a new camdec, which shows pictures again
+    await until(() => e2.states().slice(-1)[0] === 'playing', 'spot playing');
+    await sleep(1000);
+    const ns = streams().length, starts = () => nals().filter((l) => l[1] === 'start').length, st0 = starts(), w0 = e2.evs.length;
+    assert.ok(e2.evs.every((e) => e.ev !== 'state' || e.state !== 'error'), 'no stall while pictures come');
+    fs.writeFileSync(STUCK, '');
+    const tStuck = Date.now();
+    await until(() => e2.evs.slice(w0).some((e) => e.ev === 'state' && e.state === 'error'), 'the watchdog', 10000);
+    const dt = Date.now() - tStuck, err = e2.evs.slice(w0).find((e) => e.ev === 'state' && e.state === 'error');
+    assert.strictEqual(err.msg, 'picture stalled - retry in 1 s', JSON.stringify(err));
+    assert.ok(dt >= 4500 && dt < 8000, 'stalled after ~5 s: ' + dt + ' ms');
+    assert.ok(/watchdog: no new picture for 5 s while the stream sends/.test(out), 'logged');
+    // the new stream's first picture gets 10 s (a new camdec starting): still none -> again, the backoff grown
+    await until(() => streams().length === ns + 1 && e2.states().slice(-1)[0] === 'playing', 'reconnected, still stuck', 6000);
+    const tNew = Date.now(), w1 = e2.evs.length;
+    await until(() => e2.evs.slice(w1).some((e) => e.ev === 'state' && e.state === 'error'), 'the watchdog again', 14000);
+    const dt2 = Date.now() - tNew;
+    fs.unlinkSync(STUCK);
+    assert.ok(dt2 >= 9000, 'a new stream\'s first picture gets ~10 s: ' + dt2 + ' ms');
+    assert.strictEqual(e2.evs.slice(w1).find((e) => e.ev === 'state' && e.state === 'error').msg, 'picture stalled - retry in 2 s', 'no picture in between: the backoff grows');
+    await until(() => streams().length === ns + 2 && e2.states().slice(-1)[0] === 'playing', 'reconnected', 6000);
+    const s0 = e2.of('stats').length;
+    await until(() => e2.of('stats').slice(s0).some((x) => x.shown > 0), 'a new camdec shows pictures');
+    assert.strictEqual(starts(), st0 + 2, 'each time on a new camdec');
+    await sleep(6000);
+    assert.strictEqual(streams().length, ns + 2, 'no stall once pictures come again');
+    e2.s.destroy();
+    console.log('ok frame watchdog (stalled after ' + dt + ' ms, a new stream\'s first picture after ' + dt2 + ' ms, reconnected on a new camdec)');
 
     daemon.kill('SIGTERM');
     await new Promise((r) => daemon.on('exit', r));

@@ -291,6 +291,26 @@ def build_ui(spec, language='en'):
         ui['containers'][str(cid)] = cont
         if main_id is None:
             main_id = cid
+    # optional pop-ups (app.json "popups"): a container of the pop-up type with one dynamic text label,
+    # <name>_TEXT, and an optional button, <name>_OK; stackConsumer="false" as BMW's x_call does, so the
+    # pop-up never joins the HMI's screen stack (the app's own screen visibility stays as it was)
+    for pop in spec.get('popups', []):
+        cid = nid()
+        state_ids[pop['name']] = cid
+        lid, lx, lc = comp(pop.get('label', 'text3'), pop['name'] + '_TEXT', rows=[{'Text': {'value': '', 'type': 'Text'}}])
+        cx_all, comps = lx, {str(lid): lc}
+        if pop.get('button'):   # x_call's button: visible, focusable 3, enabled
+            bid, bx, bc = comp('button', pop['name'] + '_OK', rows=[text_row(pop['name'] + '_OK', pop['button'])], extra_props={3: 3, 1: 1})
+            cx_all, comps[str(bid)] = cx_all + bx, bc
+        # every BMW pop-up gives its label and button a focusId (the HMI puts the focus there); without one the
+        # HMI closed ours again at once. Ours: 0x7000 + the component id, clear of BMW's 2xxxx range
+        cx_all = [l.replace('" widget=', f'" focusId="{28672 + int(l.split(chr(34))[1])}" widget=', 1) if '<component id=' in l else l for l in cx_all]
+        gid, tgid, tid = nid(), nid(), nid()
+        comps[str(tid)] = {'type': 'title', 'name': pop['name'] + '_TITLE', 'rows': [text_row(pop['name'] + '_TITLE', pop.get('title', spec['title']))]}
+        xml += [f'    <container id="{cid}" type="{pop["type"]}" widget="{pop["widget"]}" stackConsumer="false">',
+                f'        <layoutGroup id="{gid}" name="List">', '            <property id="3" value="1"/>'] + cx_all + ['        </layoutGroup>',
+                f'        <layoutGroup id="{tgid}" name="Titlebar">', f'            <component id="{tid}" type="title"/>', '        </layoutGroup>', '    </container>']
+        ui['containers'][str(cid)] = {'type': pop['type'], 'name': pop['name'], 'components': comps}
     xml.append('</application>')
     return '\n'.join(xml) + '\n', ui, strings, state_ids
 
@@ -398,6 +418,8 @@ def build(app_id, language='en'):
             'userLoginRequired': False, 'backgroundPriority': 200, 'someipManifest': 'manifest.json',
         },
     }
+    if spec.get('startType'):   # mgu-deploy: "autostart" starts with the platform and is never stopped for being hidden
+        pkg['mguAppStartType'] = spec['startType']
     json.dump(pkg, open(os.path.join(src, 'package.json'), 'w', encoding='utf-8', newline='\n'), indent=2)
     json.dump(manifest, open(os.path.join(src, 'manifest.json'), 'w', encoding='utf-8', newline='\n'), indent=2)
     shutil.copy(os.path.join(KIT, 'platform', 'permissions.json'), os.path.join(src, 'permissions.json'))
@@ -470,7 +492,8 @@ def build(app_id, language='en'):
             body = file.read()
         with open(entry, 'wb') as file:
             file.write(comment.encode('utf-8') + body)
-    rt_spec = {k: spec.get(k) for k in ('id', 'title', 'version', 'screens', 'settings', 'config', 'startWidget')}
+    # "popups" only when declared: an app without pop-ups keeps its app-spec.json as it was (mgu.js reads SPEC.popups || [])
+    rt_spec = {k: spec.get(k) for k in ('id', 'title', 'version', 'screens', 'popups', 'settings', 'config', 'startWidget') if k != 'popups' or 'popups' in spec}
     rt_spec['stateIds'] = state_ids
     json.dump(rt_spec, open(os.path.join(src, 'javascript', 'kit', 'app-spec.json'), 'w', encoding='utf-8', newline='\n'), indent=1)
     locale = {'language': language, 'strings': load_locale(language)}

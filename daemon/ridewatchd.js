@@ -15,6 +15,7 @@
  *                   here at the first start), optional "homeSsid" (the home Wi-Fi, by hand: "car at home")}.
  *                   The app's settings set host, port, socks, socksFallback, lat and lon ({"cmd":"config"}).
  *   JAP_RIDEWATCH_CTL    /run/jap-ridewatch/ctl.sock               MGU_UPLINK /run/mgu-uplink/status.json (mgu-uplink's Wi-Fi state)
+ *                   (on the car ctl.sock comes as fd 3 from jap-ridewatch.socket: LISTEN_FDS set, the path unused)
  *   JAP_CAMDEC      /var/opt/jap-ridewatch/current/camdec      JAP_RIDEWATCH_VIDEO /dev/shm/mgu-video-ridewatch
  *
  * App -> daemon: {"cmd":"list"} {"cmd":"view","view":"spot"|"mosaic"|i,"rect":"WxH"} {"cmd":"pick","cam":i}
@@ -26,7 +27,14 @@
  *   {"cmd":"stop","why":"hidden"|"moving"} (moving keeps the pick) {"cmd":"status"}
  *   {"cmd":"swap","a":i,"b":j} (the user dropped camera a on b, b may be the hero: then a becomes the picked hero):
  *       the pane's order, kept in order.json beside server.json and sent with every spot (`o=`)
+ *   {"cmd":"hello","app":"0.4.0"} (an older daemon: {"ev":"error","cmd":"hello","msg":"unknown cmd"})
+ *   {"cmd":"listen","cam":i} {"cmd":"unlisten"} {"cmd":"talk","cam":i} {"cmd":"untalk"} (0.5.0; only what hello's "audio"
+ *       lists, refused while stopped for moving or hidden)
  * Daemon -> app: {"ev":"list","cams":[{i,name,label,shape,w,h,roles}]} {"ev":"state","state":"idle|connecting|playing|ended|error","view":..,"msg":..,"shows":..}
+ *   while the server refuses this car, also "pair" (https://<host>:18642/pair#h=<sha256 hex of the code>, the server's
+ *       setup page: the app's QR), "fp" (the hash's first 6 hex, upper case, "7F3A 9C": the check the page shows too)
+ *       and "code" (on the error state and the connecting ones between
+ *       retries; gone once playing, stopped or failing for another reason)
  *   {"ev":"clip",id,cam,label,type,start,dur}  the server's line for a clip (ms), sent when its picture starts
  *   {"ev":"layout","w","h","hero","heroRect","tiles":[{i,name,label,x,y,w,h,shape}]}  the server's line for the
  *       picture now shown (stream px), sent when the stream switches to it
@@ -36,6 +44,16 @@
  *   {"ev":"event",id,cam,label,type,ts,first,count,thumb} (live: an id already listed updates that row, the server's burst)
  *   {"ev":"thumb","id","w":160,"h":90,"rgba":base64} | {"ev":"thumb","id","none":true}  to the asker only
  *   {"ev":"stats",...camdec's stats,"kbps"}  {"ev":"error","cmd":..,"msg"}
+ *   {"ev":"hello","daemon","proto":1|2|null,"caps":[..],"tz":min|null,"audio":["listen","talk"]}  to the asker, and to all when it changes:
+ *       the server's protocol (null: not known yet, 1: an older server), what it offers, its offset from UTC in
+ *       minutes (east positive; the car's clock is UTC; null: unknown, the app keeps the unit's own time); audio: what
+ *       the server offers of listen / talk and this car can do (the sound helper's caps: listen needs a source id and
+ *       a player in its config, talk a mic lease; no helper socket = neither)
+ *   {"ev":"audio","state":"off|listening|talking","listen":"off|starting|on","talk":"off|starting|on","cam":i|null,
+ *       "why":null|"<short reason>","max":60}  on every change; why says what ended or refused the last one
+ *       (the server's: forbidden, nouser, nospeaker, ...; the helper's: call, busy, nosource, noplayer, nomic, ...;
+ *       here: moving, hidden, gone, tunnel, server, helper, max)
+ *   {"ev":"level","v":0..1}  the sound's level while listening or talking (5 a second at most)
  *
  * Hero (chooseHero), from the camera roles the server lists (set on the server, server/configure.py; all optional):
  * a doorbell ring, or a person at the "door" camera, in the last 2 min -> the door camera (a ring without one: the
@@ -43,14 +61,23 @@
  * person / vehicle / animal / package in the last 10 min (not the "garage" camera while the car is home); else the
  * "night" camera at night, the "day" camera otherwise, else the first camera.
  *
+ * Audio (0.5.0): `<token> listen <cam>` -> {"ev":"listen","rate","ch":1,"fmt":"s16le"} then PCM, sent to the sound
+ * helper (jap-ridewatch-audio, /run/jap-ridewatch/audio.sock: {"cmd":"play"} then the PCM, 0.5 s held at most, live);
+ * `<token> talk <cam>` -> {"ev":"talk","ok":true,...,"max":60} then the helper's {"cmd":"mic"} PCM goes to the server
+ * until untalk (the server's end: EOF), the server's or the helper's close, or 61 s. The server first: a refused talk
+ * never borrows the mic. stop() (moving, hidden, the last app gone, another server, SIGTERM) ends both.
+ *
  * A view: SOCKS5 connect, `<token> spot <hero> WxH` / `mosaic2 WxH` (the server's layout line first, then Annex-B)
  * or `<token> cam i WxH` or `<token> clip <id> WxH` (its {"ev":"clip"} line first, or {"ev":"clip","error"}).
  * Switching: camdec keeps running and its stdin moves to the new connection once that one's first IDR is in (camdec
  * resets on the new SPS and keeps its last frame meanwhile, so the old picture stays; a restarted camdec would re-init
  * the MSDK and could recreate the MGVF file, a black flash). While the new one connects, the old stream is cut at NAL
  * boundaries so camdec never gets a half NAL before the new SPS.
- * Drops reconnect after 1, 2, 4, 8, 10 s (not a clip: its end is "ended", its failure "error"); the last app
- * connection gone stops everything at once (camdec killed after 1 s if stdin EOF did not end it). The token is never
+ * Drops reconnect after 1, 2, 4, 8, 10 s (not a clip: its end is "ended", its failure "error"), and so does a live
+ * stream whose bytes keep coming while camdec shows no new picture for 5 s (watchdog(): on a new camdec); the last app
+ * connection gone stops everything at once (camdec killed after 1 s if stdin EOF did not end it). The event feed
+ * redials after 1 .. 10 s, after 10 s .. 5 min while the app is hidden ({"cmd":"stop","why":"hidden"}), and a 30 s
+ * watchdog dials it again if it is down with no redial planned. The token is never
  * logged (the app shows it while the server refuses the car, so that it can be added there). Never exits on an error.
  */
 const { spawn } = require('child_process');
@@ -59,13 +86,37 @@ const net = require('net');
 const socks = require('./socks');
 const decodeJpeg = require('./vendor/jpeg-js/decoder.js');
 
+/**
+ * Started as root (systemd 237 takes no User= for a uid without an account): drop to JAP_RIDEWATCH_RUNAS
+ * (uid:gid[:group,...], the unit's 3911:3911:video) before anything else is read; any doubt = exit.
+ */
+(function dropRoot() {
+    const R = process.env.JAP_RIDEWATCH_RUNAS;
+    if (process.getuid() !== 0) return;
+    // root without the unit's line: refused, but for the tests and check.sh, which say so
+    if (!R && process.env.JAP_RIDEWATCH_TEST_AS_ROOT === '1') return;
+    if (!R) { console.error('ridewatchd: root without JAP_RIDEWATCH_RUNAS, not starting'); process.exit(1); }
+    const m = /^(\d+):(\d+)(?::([\w,-]+))?$/.exec(R), uid = m ? +m[1] : 0, gid = m ? +m[2] : 0;
+    const die = (w) => { console.error('JAP_RIDEWATCH_RUNAS=' + R + ': ' + w); process.exit(1); };
+    if (!uid || !gid) die('want uid:gid[:group,...], not root');
+    try {
+        process.setgroups([gid].concat(m[3] ? m[3].split(',').map((g) => (/^\d+$/.test(g) ? +g : g)) : []));
+        process.setgid(gid);
+        process.setuid(uid);
+    } catch (e) { die(e.message); }
+    if (process.getuid() !== uid || process.geteuid() !== uid || process.getgid() !== gid || process.getgroups().indexOf(0) >= 0) die('still root');
+})();
+
 const CONF = process.env.JAP_RIDEWATCH_CONF || '/var/opt/jap-ridewatch/state/server.json';
-const ORDER = require('path').join(require('path').dirname(CONF), 'order.json');   // the state dir: nobody's, 0700
+const ORDER = require('path').join(require('path').dirname(CONF), 'order.json');   // the state dir: ours (3911), 0700
 const CTL = process.env.JAP_RIDEWATCH_CTL || '/run/jap-ridewatch/ctl.sock';
 const BIN = process.env.JAP_CAMDEC || '/var/opt/jap-ridewatch/current/camdec';
 const VIDEO = process.env.JAP_RIDEWATCH_VIDEO || '/dev/shm/mgu-video-ridewatch';
 const UPLINK = process.env.MGU_UPLINK || '/run/mgu-uplink/status.json';
+const AUDIO = process.env.JAP_RIDEWATCH_AUDIO || '/run/jap-ridewatch/audio.sock';
+const VERSION = '0.5.4';
 const BACKOFF = [1000, 2000, 4000, 8000, 10000];
+const BACKOFF_HIDDEN = [10000, 30000, 60000, 120000, 300000];   // the event feed while the app is hidden
 const FIRST_MS = 10000;          // connect to first IDR (measured 0.2 s cam, 0.5 s mosaic, 0.8-1.4 s spot)
 const CLIP_FIRST_MS = 40000;     // a clip: Protect login + export (0.5 s for 8 s measured, the server waits 30 s at most)
 // the server's clip error codes (serve.py clip()), as the app shows them
@@ -73,6 +124,7 @@ const CLIP_ERR = { event: 'Event not found', config: 'Protect is not set up on t
     login: 'Protect refused the login', cameras: 'Camera not found in Protect', camera: 'Camera not found in Protect',
     export: 'Recording unavailable' };
 const SILENT_MS = 5000;          // a live stream quiet this long is a drop (a half-open tunnel)
+const STALL_MS = 5000;           // a live stream whose bytes still come with no new picture this long is a drop too
 const EVENTS_SILENT_MS = 40000;  // the event feed pings every 15 s
 const MAX_PENDING = 4 << 20;     // bytes held before the first IDR
 const TYPES = ['person', 'vehicle', 'animal', 'package', 'motion', 'ring'];
@@ -92,11 +144,14 @@ let next = null;      // the connection being opened: its bytes held until its f
 let dec = null, paused = false;
 let tries = 0, retryT = null;
 let state = 'idle', msg = null, layout = null, rx = 0, rxT = Date.now();
-let cams = [], events = [], picked = null, hero = null;
+let stall = null;     // the frame watchdog: { shown, bytes, t, first } at camdec's last new picture (the stream's bytes then)
+let cams = [], events = [], picked = null, hero = null, hidden = false;
 
 // shows: the view camdec is fed now (the old one until the new one's first IDR): what the app draws over
-const stateEv = () => ({ ev: 'state', state, view: want ? want.view : null, msg, shows: cur ? cur.w.view : state === 'ended' ? 'clip' : null });
-function setState(s, m) { state = s; msg = m || null; broadcast(stateEv()); }
+let pair = null;      // while the server refuses this car: { pair, fp, code } (see pairOf)
+const stateEv = () => Object.assign({ ev: 'state', state, view: want ? want.view : null, msg, shows: cur ? cur.w.view : state === 'ended' ? 'clip' : null }, pair);
+// connecting keeps the refused car's QR up between retries
+function setState(s, m, p) { state = s; msg = m || null; if (s !== 'connecting') pair = p || null; broadcast(stateEv()); }
 
 const REFUSED = 'server refused this car';
 const CODE = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';     // no 0/O or 1/I: read off the screen, typed on the server
@@ -111,6 +166,12 @@ function writeConf(c) {
     fs.writeFileSync(CONF + '.tmp', JSON.stringify(c, null, 1) + '\n', { mode: 0o600 });
     fs.renameSync(CONF + '.tmp', CONF);
 }
+/** The refused car's pairing link: the server's setup page with the code's SHA-256 (no bit of the code in the URL), and
+ *  that hash's short fingerprint, shown by the car under the QR and by the page before it adds the car. */
+const pairOf = (c) => {
+    const h = require('crypto').createHash('sha256').update(c.token, 'utf8').digest('hex');
+    return { pair: 'https://' + c.host + ':18642/pair#h=' + h, fp: h.slice(0, 4).toUpperCase() + ' ' + h.slice(4, 6).toUpperCase(), code: c.token };
+};
 /** server.json as a checked config; makes the car's code at the first start. */
 function conf() {
     let c = readConf();
@@ -144,18 +205,21 @@ function configure(m) {
     log('config: server ' + (c.host || 'not set') + ':' + c.port + ', socks ' + c.socks + (c.socksFallback ? ', fallback ' + c.socksFallback : ''));
     if (!moved) return rehero();
     cams = [];                                         // another server: its cameras, its events
-    if (clients.size) { eventsClose(); eventsOpen(); list().then((l) => { cams = l; broadcast({ ev: 'list', cams }); rehero(); }, (e) => log('list:', e.message)); }
+    if (clients.size) { eventsClose(); eventsOpen(); list().then((l) => { cams = l; broadcast({ ev: 'list', cams }); greet(); rehero(); }, (e) => log('list:', e.message)); }
     if (want) { const w = want; stop('server changed', true); want = w; go(); }
 }
 // socksFallback: a second tunnel. A dead one costs socks.js' 5 s timeout once, then the fallback is used first for a
 // minute so each view does not pay it again.
-let fbUntil = 0;
+let fbUntil = 0, fbSaid = false;                       // fbSaid: the switch logged once per outage
 function dial(c) {
     const main = () => socks.connect(c.socksHost, c.socksPort, c.host, c.port);
     if (!c.fbPort) return main();
     const fb = () => socks.connect(c.fbHost, c.fbPort, c.host, c.port).then((r) => { fbUntil = Date.now() + 60000; return r; });
     if (Date.now() < fbUntil) return fb().catch(() => { fbUntil = 0; return main(); });
-    return main().catch((e) => { log('tunnel ' + c.socksPort + ': ' + e.message + ', trying ' + c.fbPort); return fb(); });
+    return main().then((r) => { fbSaid = false; return r; }, (e) => {
+        if (!fbSaid) { fbSaid = true; log('tunnel ' + c.socksPort + ': ' + e.message + ', trying ' + c.fbPort); }
+        return fb();
+    });
 }
 
 /* ---- the camera list: one request, the answer until the server closes ---- */
@@ -183,6 +247,47 @@ async function list() {
     });
 }
 const str = (v) => String(v == null ? '' : v).slice(0, 60);
+
+/* ---- the server's hello, asked once per server and code after a list it answered ---- */
+let srvInfo = null, srvKey = null, srvTz = null;    // srvInfo: { proto, caps } ({} while asked)
+const tzOk = (v) => Number.isInteger(v) && Math.abs(v) <= 840;
+const helloEv = () => ({ ev: 'hello', daemon: VERSION, proto: srvInfo && srvInfo.proto ? srvInfo.proto : null, caps: srvInfo && srvInfo.caps ? srvInfo.caps : [], tz: srvTz, audio: audioCaps() });
+/** what the car can do of the server's listen / talk: the sound helper's socket is there (the tool installs it) */
+/** listen / talk: the server able to, and the sound helper able to (its config's sources and player, a mic lease) */
+function audioCaps() {
+    const caps = srvInfo && srvInfo.caps ? srvInfo.caps : [];
+    return ['listen', 'talk'].filter((x) => caps.indexOf(x) >= 0 && (x === 'listen' ? hlpCaps.play : hlpCaps.mic));
+}
+/** asks the helper what it could do, at each app's hello and the server's (no socket: nothing, not installed or not enabled) */
+let hlpCaps = { play: false, mic: false };
+function helperCaps() {
+    const set = (c) => { if (c.play === hlpCaps.play && c.mic === hlpCaps.mic) return; hlpCaps = c; broadcast(helloEv()); };
+    if (!fs.existsSync(AUDIO)) return set({ play: false, mic: false });
+    const h = net.connect(AUDIO);
+    h.on('error', () => {});
+    h.on('connect', () => h.write(JSON.stringify({ cmd: 'caps' }) + '\n'));
+    firstLine(h, 3000, (e, o) => { h.destroy(); set(!e && o && o.ev === 'caps' ? { play: o.play === true, mic: o.mic === true } : { play: false, mic: false }); });
+}
+function setTz(v) { if (tzOk(v) && v !== srvTz) { srvTz = v; broadcast(helloEv()); } }
+/** After a list that worked: no bytes to hello = an older server (proto 1); a refused car never gets here. */
+function greet() {
+    let c;
+    try { c = conf(); } catch (e) { return; }
+    const key = c.host + ':' + c.port + ' ' + c.token;
+    if (srvKey === key) return;
+    srvKey = key; srvInfo = {}; srvTz = null;
+    ask('hello', 65536).then((b) => {
+        if (srvKey !== key) return;
+        let o = null;
+        try { o = b.length ? JSON.parse(b.toString('utf8')) : null; } catch (e) { /* proto 1 */ }
+        const v2 = o && o.ev === 'hello' && Number.isInteger(o.proto) && o.proto >= 2;
+        srvInfo = { proto: v2 ? o.proto : 1, caps: v2 && Array.isArray(o.caps) ? o.caps.filter((x) => typeof x === 'string').slice(0, 16).map(str) : [] };
+        if (v2 && tzOk(o.tz)) srvTz = o.tz;
+        log('server: proto ' + srvInfo.proto + (srvTz === null ? '' : ', tz ' + srvTz));
+        helperCaps();
+        broadcast(helloEv());
+    }, (e) => { if (srvKey === key) srvKey = null; log('hello:', e.message); });
+}
 const px = (v) => (Number.isInteger(v) && v > 0 && v <= 16384 ? v : null);       // null: an older server (no size)
 
 /* ---- the pane's order (serve.py arrange()): order[0] the camera at home in the hero's place, then the pane ---- */
@@ -280,7 +385,7 @@ function eventsOpen() {
         evSock = sock;
         sock.write(c.token + ' events\n');
         sock.setTimeout(EVENTS_SILENT_MS, () => sock.destroy());
-        let buf = '', got = false;
+        let buf = '', got = false, bad = false;
         const data = (d) => {
             buf += d;
             let i;
@@ -288,6 +393,7 @@ function eventsOpen() {
                 const line = buf.slice(0, i); buf = buf.slice(i + 1);
                 let m; try { m = JSON.parse(line); } catch (x) { continue; }
                 got = true;
+                if (tzOk(m.tz)) setTz(m.tz);                   // (a v2 server: the first line and every ping)
                 if (m.ev === 'events' && Array.isArray(m.list)) { events = m.list.map(event).filter(Boolean).sort((x, y) => x.ts - y.ts).slice(-50); broadcast({ ev: 'events', list: events }); } else if (m.ev === 'event') {
                     const e = event(m);
                     if (!e) continue;
@@ -299,16 +405,34 @@ function eventsOpen() {
             }
             if (buf.length > 1 << 20) buf = '';
         };
+        // close and error first, then the bytes: a line that throws closes the feed, which is dialed again (it used to
+        // throw before the handlers were on, leaving evSock set and the feed dead)
+        const take = (d) => { try { data(d); } catch (e) { bad = true; log('events: bad line:', e.message); sock.destroy(); } };
         sock.setEncoding('utf8');
-        if (rest.length) data(rest.toString('utf8'));
-        sock.on('data', data);
         sock.on('error', () => {});
-        sock.on('close', () => { if (gen !== evGen) return; evSock = null; if (got) evTries = 0; eventsLater(); });
-    }, () => { if (gen === evGen) { evSock = null; eventsLater(); } });
+        sock.on('close', () => { if (gen !== evGen) return; log('events: feed closed'); evSock = null; if (got && !bad) evTries = 0; eventsLater(); });
+        sock.on('data', take);
+        if (rest.length) take(rest.toString('utf8'));
+    }, (e) => { if (gen === evGen) { log('events: dial failed:', e && e.message); evSock = null; eventsLater(); } });
+}
+/** The feed's watchdog (every 30 s): an app connected, no redial planned, and no feed (or a dead one, or a dial stuck
+ *  over 30 s) -> dial again. */
+let evDialT = 0;
+function eventsWatch() {
+    if (!clients.size || evTimer) return;
+    if (evSock === 'dialing') {
+        if (!evDialT) evDialT = Date.now();
+        else if (Date.now() - evDialT > 30000) { log('events: watchdog, dial stuck'); evGen++; evSock = null; evDialT = 0; eventsOpen(); }
+        return;
+    }
+    evDialT = 0;
+    if (evSock && !evSock.destroyed) return;
+    log('events: watchdog, feed was ' + (evSock ? 'a dead socket' : 'down') + ', dialing');
+    evSock = null; eventsOpen();
 }
 function eventsLater() {
     if (!clients.size || evTimer) return;
-    const ms = BACKOFF[Math.min(evTries++, BACKOFF.length - 1)];
+    const B = hidden ? BACKOFF_HIDDEN : BACKOFF, ms = B[Math.min(evTries++, B.length - 1)];
     evTimer = setTimeout(() => { evTimer = null; eventsOpen(); }, ms);
 }
 function eventsClose() {
@@ -341,7 +465,7 @@ function thumbRun() {
     while (thumbJobs < THUMB_JOBS && thumbQ.length) {
         const id = thumbQ.shift();
         thumbJobs++;
-        thumbFetch(id).then((jpeg) => (jpeg.length ? scale(decodeJpeg(jpeg, { useTArray: true, formatAsRGBA: true, maxResolutionInMP: 2, maxMemoryUsageInMB: 32 })) : null))
+        ask('thumb ' + id, THUMB_MAX).then((jpeg) => (jpeg.length ? scale(decodeJpeg(jpeg, { useTArray: true, formatAsRGBA: true, maxResolutionInMP: 2, maxMemoryUsageInMB: 32 })) : null))
             .catch((e) => { log('thumb', id + ':', e.message); return undefined; })
             .then((v) => {
                 thumbJobs--;
@@ -353,15 +477,16 @@ function thumbRun() {
             });
     }
 }
-async function thumbFetch(id) {
+/** `<token> <req>`: the whole answer, until the server closes (at most max bytes). */
+async function ask(req, max) {
     const c = conf();
     const { sock, rest } = await dial(c);
-    sock.write(c.token + ' thumb ' + id + '\n');
+    sock.write(c.token + ' ' + req + '\n');
     return new Promise((resolve, reject) => {
         const bufs = [rest];
         let n = rest.length;
         sock.setTimeout(10000, () => sock.destroy(new Error('no answer')));
-        sock.on('data', (d) => { n += d.length; if (n > THUMB_MAX) sock.destroy(new Error('over 1 MB')); else bufs.push(d); });
+        sock.on('data', (d) => { n += d.length; if (n > max) sock.destroy(new Error('over ' + max + ' bytes')); else bufs.push(d); });
         sock.on('error', reject);
         sock.on('close', (err) => { if (!err) resolve(Buffer.concat(bufs)); });
     });
@@ -381,6 +506,135 @@ function scale(img) {
     }
     return out;
 }
+
+/* ---- Listen and Talk: the server's PCM <-> the sound helper (jap-ridewatch-audio) ---- */
+const AUDIO_HELD = 24000;        // 0.5 s of 24 kHz s16le held toward the helper; more is dropped (live sound)
+const TALK_HELD = 32000;         // 1 s of 16 kHz toward the server
+const TALK_MS = 61000;           // backstop: the server ends a talk after its max (60 s)
+const AUDIO_FIRST_MS = 15000;    // the server sends its listen line once sound flows (10 s at most)
+const BUSY_RETRY_MS = 5000, BUSY_FOR_MS = 75000;   // a listen the server still holds (a dead tunnel's, until TCP keepalive)
+const WHY = /^[a-z]{1,16}$/;
+const aud = { listen: null, talk: null };
+let audWhy = null, levelT = 0, levelSq = 0, levelN = 0, halted = null;   // halted: stopped for moving / hidden (no sound then)
+const phase = (a) => (!a ? 'off' : a.up ? 'on' : 'starting');
+const audioEv = () => ({ ev: 'audio', state: aud.talk && aud.talk.up ? 'talking' : aud.listen && aud.listen.up ? 'listening' : 'off',
+    listen: phase(aud.listen), talk: phase(aud.talk), cam: (aud.talk || aud.listen || { cam: null }).cam, why: audWhy, max: TALK_MS / 1000 - 1 });
+/** s16le: whole samples only; an odd byte waits in o.odd for the next chunk */
+function whole(o, d) {
+    if (o.odd) { d = Buffer.concat([o.odd, d]); o.odd = null; }
+    if (d.length & 1) { o.odd = d.slice(d.length - 1); d = d.slice(0, d.length - 1); }
+    return d;
+}
+/** the level of what is piped (s16le), sent 5 times a second at most */
+function level(b) {
+    for (let i = 0; i + 1 < b.length; i += 8) { const v = b.readInt16LE(i); levelSq += v * v; levelN++; }
+    const now = Date.now();
+    if (now - levelT < 200 || !levelN) return;
+    broadcast({ ev: 'level', v: Math.min(1, Math.round(Math.sqrt(levelSq / levelN) / 3277 * 100) / 100) });
+    levelT = now; levelSq = 0; levelN = 0;
+}
+/** one JSON line from sock (at most 4 KiB, within ms), then cb(err, obj, rest) with the bytes after it */
+function firstLine(sock, ms, cb) {
+    let buf = Buffer.alloc(0), done = false;
+    const end = (e, o, rest) => { if (done) return; done = true; clearTimeout(t); sock.removeListener('data', on); cb(e, o, rest); };
+    const t = setTimeout(() => end(new Error('timeout')), ms);
+    const on = (d) => {
+        buf = Buffer.concat([buf, d]);
+        const k = buf.indexOf(10);
+        if (k < 0) { if (buf.length > 4096) end(new Error('line too long')); return; }
+        let o = null;
+        try { o = JSON.parse(buf.slice(0, k).toString('utf8')); } catch (e) { return end(new Error('not JSON')); }
+        end(null, o, buf.slice(k + 1));
+    };
+    sock.on('data', on);
+    sock.on('close', () => end(new Error('closed')));
+}
+function audioStart(kind, cam) {
+    if (audioCaps().indexOf(kind) < 0) throw new Error('no ' + kind + ' on this server or car');
+    if (!Number.isInteger(cam) || cam < 0 || cam >= 64) throw new Error('bad camera');
+    if (halted) { audWhy = halted; return broadcast(audioEv()); }
+    const was = aud[kind];
+    if (was && was.cam === cam) return broadcast(audioEv());
+    if (was) audioEnd(was, null);
+    const a = aud[kind] = { kind, cam, srv: null, hlp: null, up: false, done: false, t0: Date.now(), tOk: 0, timer: null, odd: null };
+    audWhy = null;
+    broadcast(audioEv());
+    audioDial(a);
+}
+function audioDial(a) {
+    let c;
+    try { c = conf(); } catch (e) { return audioEnd(a, 'server'); }
+    log(a.kind, a.cam);
+    dial(c).then(({ sock, rest }) => {
+        if (a.done) return sock.destroy();
+        a.srv = sock;
+        sock.on('error', () => {});
+        sock.write(c.token + ' ' + a.kind + ' ' + a.cam + '\n');
+        firstLine(sock, AUDIO_FIRST_MS, (e, o, more) => {
+            if (a.done) return;
+            if (e) return audioEnd(a, 'server');
+            if (!o || o.ev !== a.kind) return audioEnd(a, 'server');
+            if (o.error !== undefined) {
+                const why = WHY.test(o.error) ? o.error : 'server';
+                // busy right after a drop: the server still holds the dead tunnel's listen; again in 5 s, for 75 s
+                if (why === 'busy' && a.kind === 'listen' && Date.now() - a.t0 < BUSY_FOR_MS) {
+                    sock.destroy(); a.srv = null;
+                    log('listen: busy on the server, again in ' + BUSY_RETRY_MS / 1000 + ' s');
+                    a.timer = setTimeout(() => { if (!a.done) audioDial(a); }, BUSY_RETRY_MS);
+                    return;
+                }
+                return audioEnd(a, why);
+            }
+            const rate = a.kind === 'talk' ? 16000 : o.rate;
+            if ((a.kind === 'talk' && o.ok !== true) || [16000, 24000, 48000].indexOf(o.rate) < 0 || o.ch !== 1 || o.fmt !== 's16le' || o.rate !== rate) return audioEnd(a, 'server');
+            // a talk the server closed at its cap (60 s from its answer) said as max; any other close: server
+            sock.on('close', () => audioEnd(a, a.kind === 'talk' && Date.now() - a.tOk >= 59000 ? 'max' : 'server'));
+            a.tOk = Date.now();
+            audioHelper(a, rate, Buffer.concat([rest, more]));
+        });
+    }, () => audioEnd(a, 'tunnel'));
+}
+function audioHelper(a, rate, early) {
+    const h = a.hlp = net.connect(AUDIO);
+    h.on('error', () => {});
+    h.on('connect', () => h.write(JSON.stringify(a.kind === 'listen' ? { cmd: 'play', rate } : { cmd: 'mic' }) + '\n'));
+    firstLine(h, 10000, (e, o, more) => {
+        if (a.done) return;
+        if (e || !o || o.ev !== (a.kind === 'listen' ? 'play' : 'mic')) return audioEnd(a, 'helper');
+        if (o.ok !== true) return audioEnd(a, WHY.test(o.why) ? o.why : 'helper');
+        a.up = true;
+        broadcast(audioEv());
+        log(a.kind, a.cam, 'on');
+        if (a.kind === 'listen') {
+            // the helper's lines from now on: its end ({"ev":"end","why"}); the server's PCM goes to it
+            firstLine(h, 24 * 3600e3, (e2, o2) => { if (!e2 && o2 && o2.ev === 'end') audioEnd(a, WHY.test(o2.why) ? o2.why : 'helper'); });
+            // whole samples before any drop (an odd chunk dropped would shift every sample after it)
+            const pipe = (d) => { if (a.done) return; d = whole(a, d); level(d); if (d.length && h.writableLength < AUDIO_HELD) h.write(d); };
+            if (early.length) pipe(early);
+            a.srv.on('data', pipe);
+        } else {
+            const pipe = (d) => { if (a.done) return; d = whole(a, d); level(d); if (d.length && a.srv.writableLength < TALK_HELD) a.srv.write(d); };
+            if (more.length) pipe(more);
+            h.on('data', pipe);
+            a.timer = setTimeout(() => audioEnd(a, 'max'), TALK_MS);
+        }
+        h.on('close', () => audioEnd(a, a.kind === 'talk' ? 'returned' : 'helper'));
+    });
+}
+/** why: null for an end asked by the app (unlisten, untalk, another camera) */
+function audioEnd(a, why) {
+    if (a.done) return;
+    a.done = true;
+    clearTimeout(a.timer);
+    if (aud[a.kind] === a) aud[a.kind] = null;
+    if (a.hlp) a.hlp.destroy();                        // the helper's end: player stopped and released, the mic returned
+    // talk: EOF, the server finishes what it got; listen: the close ends the server's ffmpeg
+    if (a.srv) { if (a.kind === 'talk') { const s = a.srv; s.end(); setTimeout(() => s.destroy(), 2000).unref(); } else a.srv.destroy(); }
+    if (why !== undefined) audWhy = why;
+    log(a.kind, a.cam, 'off' + (why ? ' (' + why + ')' : ''));
+    broadcast(audioEv());
+}
+function audioStop(why) { ['talk', 'listen'].forEach((k) => { if (aud[k]) audioEnd(aud[k], why); }); }
 
 /* ---- Annex-B: start codes (00 00 01; a 4-byte one's leading zero counts as the NAL before's trailing zero) ---- */
 /** [{ at, type }] of the start codes in b whose type byte is in b, from index `from`. */
@@ -490,6 +744,7 @@ function switchTo(conn, data) {
     if (layout) broadcast(Object.assign({ ev: 'layout' }, layout));
     if (conn.clip) broadcast(Object.assign({ ev: 'clip' }, conn.clip));
     decoder();
+    stall = { shown: -1, bytes: conn.bytes, t: Date.now(), first: true };   // (a new stream: from its first IDR)
     rx = data.length; rxT = Date.now();
     write(data);
     setState('playing');
@@ -534,9 +789,9 @@ function closed(conn, why) {
 function retry(why) {
     const ms = BACKOFF[Math.min(tries, BACKOFF.length - 1)];
     tries++;
-    let say = why;                                     // the refused car's code: shown, never logged
-    if (why === REFUSED) try { say = 'Server refused this car: add code ' + conf().token + ' on the server'; } catch (e) { /* the why */ }
-    setState('error', say + ' - retry in ' + ms / 1000 + ' s');
+    let say = why, p = null;                           // the refused car's code: shown, never logged
+    if (why === REFUSED) try { const c = conf(); p = pairOf(c); say = 'Server refused this car: add code ' + c.token + ' on the server'; } catch (e) { /* the why */ }
+    setState('error', say + ' - retry in ' + ms / 1000 + ' s', p);
     clearTimeout(retryT);
     retryT = setTimeout(() => { retryT = null; if (want && !next && !cur) open(want); else if (want) go(); }, ms);
 }
@@ -550,9 +805,10 @@ function decoder() {
     const end = (code) => {
         if (ended) return;
         ended = true;
-        if (dec === c) { dec = null; paused = false; }
+        const mine = dec === c;                        // (not one stopped or let go by the watchdog)
+        if (mine) { dec = null; paused = false; }
         log('camdec exited', code);
-        if (want && cur && cur.sock) fail(cur, EXIT[code] || 'decoder exited (' + code + ')');   // a fresh connection: a fresh IDR
+        if (mine && want && cur && cur.sock) fail(cur, EXIT[code] || 'decoder exited (' + code + ')');   // a fresh connection: a fresh IDR
     };
     c.stdin.on('error', () => { /* it died: exit says */ });
     let buf = '';
@@ -565,7 +821,11 @@ function decoder() {
             let e; try { e = JSON.parse(line); } catch (x) { continue; }
             if (e.ev === 'stats') {
                 if (c !== dec) continue;
-                if (cur) tries = 0;                        // a decoder that runs: the backoff starts again from 1 s
+                if (stall && e.shown !== stall.shown) {
+                    const pic = stall.shown >= 0;              // (not the first stats since the switch)
+                    if (cur && pic) tries = 0;                 // a picture shown: the backoff starts again from 1 s
+                    stall = { shown: e.shown, bytes: cur ? cur.bytes : 0, t: Date.now(), first: stall.first && !pic };
+                }
                 const now = Date.now(), kbps = Math.round(rx * 8 / Math.max(1, now - rxT));
                 rx = 0; rxT = now;
                 broadcast(Object.assign({}, e, { ev: 'stats', kbps }));
@@ -578,8 +838,26 @@ function decoder() {
     c.on('error', (e) => { log('camdec spawn failed:', e.message); end(-1); });
 }
 
+/**
+ * The frame watchdog (RideTube's idea): camdec's `shown` flat for STALL_MS while the stream's bytes still came (a
+ * stream it cannot decode, or camdec stuck: a hung one prints no stats either) -> the stream fails and reconnects with
+ * the backoff, on a new camdec. shortcut: clips are not watched (closed() would say a cut clip "ended"); add a clip
+ * error there if a recording ever stalls.
+ */
+function watchdog() {
+    if (!cur || !cur.sock || !dec || !stall || state !== 'playing' || cur.w.view === 'clip') return;
+    // a new stream's first picture gets FIRST_MS (a new camdec's MSDK start is not measured on the car)
+    if (Date.now() - stall.t < (stall.first ? FIRST_MS : STALL_MS) || cur.bytes === stall.bytes) return;
+    log('watchdog: no new picture for ' + STALL_MS / 1000 + ' s while the stream sends (' + (cur.bytes - stall.bytes) + ' bytes)');
+    const c = dec;
+    dec = null; paused = false; stall = null;
+    fail(cur, 'picture stalled');
+    c.kill('SIGKILL');
+}
+
 /* ---- commands ---- */
-function stop(why, keepPick) {
+function stop(why, keepPick, audioWhy) {
+    audioStop(audioWhy || 'gone');
     if (why && (want || dec)) log('stop:', why);
     want = null;
     if (!keepPick) picked = null;                      // the pick lasts while the user is in the app (driving off keeps it)
@@ -619,6 +897,8 @@ function view(m) {
     if (v === 'clip' && (typeof id !== 'string' || !ID.test(id))) throw new Error('bad clip id');
     if (want && want.view === v && want.id === id && want.rect === r[0] && (cur || next || retryT)) return;   // already there or on its way
     want = { view: v, rect: r[0], id };
+    halted = null;
+    if (hidden) { hidden = false; if (evTimer) { clearTimeout(evTimer); evTimer = null; evTries = 0; eventsOpen(); } }   // shown again: the feed now
     if (v === 'spot' && !hero) rehero();
     go();
 }
@@ -629,8 +909,10 @@ async function handle(c, m) {
         send(c, stateEv());
         if (layout && cur) send(c, Object.assign({ ev: 'layout' }, layout));
         if (hero) send(c, Object.assign({ ev: 'hero' }, hero));
+        send(c, audioEv());
         return send(c, { ev: 'events', list: events });
-    case 'list': cams = await list(); broadcast({ ev: 'list', cams }); return rehero();
+    case 'list': cams = await list(); broadcast({ ev: 'list', cams }); greet(); return rehero();
+    case 'hello': helperCaps(); return send(c, helloEv());
     case 'view': return view(m);
     case 'config': return configure(m);
     case 'pick':
@@ -646,18 +928,22 @@ async function handle(c, m) {
         if (m.b === h || m.a === h) picked = m.a === h ? m.b : m.a;     // onto the hero (or the hero onto a tile): the new hero
         return rehero();
     }
-    case 'stop': return stop('asked' + (m.why ? ' (' + String(m.why).slice(0, 20) + ')' : ''), m.why === 'moving');
+    case 'stop':
+        hidden = m.why === 'hidden';
+        halted = m.why === 'moving' || m.why === 'hidden' ? m.why : null;
+        return stop('asked' + (m.why ? ' (' + String(m.why).slice(0, 20) + ')' : ''), m.why === 'moving', halted);
+    case 'listen': case 'talk': return audioStart(m.cmd, m.cam);
+    case 'unlisten': case 'untalk': { const a = aud[m.cmd.slice(2)]; if (a) audioEnd(a, null); else broadcast(audioEv()); return; }
     default: throw new Error('unknown cmd');
     }
 }
 
 function serve() {
-    try { fs.unlinkSync(CTL); } catch (e) { /* none */ }
     const srv = net.createServer((c) => {
         clients.add(c);
         eventsOpen();
         // the roles the hero's rules use: before a spot is asked
-        if (!cams.length) list().then((l) => { cams = l; rehero(); }, (e) => log('list:', e.message));
+        if (!cams.length) list().then((l) => { cams = l; greet(); rehero(); }, (e) => log('list:', e.message));
         c.setEncoding('utf8');
         let buf = '';
         c.on('data', (d) => {
@@ -675,9 +961,19 @@ function serve() {
         c.on('close', () => { clients.delete(c); if (!clients.size) { stop('last app connection gone'); eventsClose(); } });
     });
     srv.on('error', (e) => log('ctl listen failed:', e.message));
-    srv.listen(CTL, () => { try { fs.chmodSync(CTL, 0o660); } catch (e) { /* tmpfs without chmod */ } log('ctl on', CTL); });
+    // on the car jap-ridewatch.socket passes ctl.sock as fd 3: root's, for the RideWatch app's uid alone (socklock.sh);
+    // a path of its own only outside systemd (tests)
+    const fds = process.env.LISTEN_FDS;
+    for (const k of ['LISTEN_FDS', 'LISTEN_PID', 'LISTEN_FDNAMES']) delete process.env[k];   // not camdec's
+    if (fds) srv.listen({ fd: 3 }, () => log('ctl on fd 3 (' + CTL + ')'));
+    else {
+        try { fs.unlinkSync(CTL); } catch (e) { /* none */ }
+        srv.listen(CTL, () => { try { fs.chmodSync(CTL, 0o660); } catch (e) { /* tmpfs without chmod */ } log('ctl on', CTL); });
+    }
     // windows expire and night falls without any event
     setInterval(() => { if (clients.size) rehero(); }, 30000).unref();
+    setInterval(watchdog, 1000).unref();
+    setInterval(eventsWatch, 30000).unref();
 }
 
 if (require.main === module) {

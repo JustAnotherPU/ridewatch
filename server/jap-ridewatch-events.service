@@ -8,6 +8,7 @@ Wants=network-online.target
 ExecStart=/usr/bin/python3 /opt/jap-ridewatch/events.py
 User=japridewatch
 StateDirectory=jap-ridewatch
+StateDirectoryMode=0700
 Restart=always
 RestartSec=5
 Nice=5

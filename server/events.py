@@ -85,7 +85,7 @@ def grab(cam, eid):
                     e['thumb'] = True
             save(evs)
     else:
-        sys.stderr.write('thumb %s failed: %s\n' % (eid, r.stderr.decode(errors='replace')[-200:]))
+        sys.stderr.write('thumb %s failed: %s\n' % (eid, serve.scrub(r.stderr.decode(errors='replace'))[-200:]))
 
 
 def record(cams, name, typ, ts, grab_=None):
@@ -285,7 +285,7 @@ if __name__ == '__main__':
         os.makedirs(THUMBS, exist_ok=True)
         conf = json.load(open(CONF))
         ha = conf.get('events_from') and conf.get('events_token')
-        if conf.get('protect') and conf.get('events_protect', True):
+        if (conf.get('protect') or {}).get('username') and conf.get('events_protect', True):   # a host alone (setup page, no runtime user): live views only
             threading.Thread(target=poller, daemon=True).start()
         if ha:
             http.server.ThreadingHTTPServer(('0.0.0.0', 18641), H).serve_forever()

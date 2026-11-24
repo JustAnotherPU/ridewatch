@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=jap-ridewatch-audio: plays the doorbell in the car (Listen) and passes a lent mic (Talk) for RideWatch
+RequiresMountsFor=/var/opt
+Requires=jap-ridewatch-audio.socket
+After=jap-ridewatch-audio.socket
+
+[Service]
+# root: the car's SOME/IP policy (/etc/vsomeip/<uid>_<gid>, uid and gid matched) lets root reach the AudioManager and
+# has no entry for RideWatch's uid 3911; the car's own voice helper runs as root for the same reason. Only
+# jap-ridewatch.service (3911) and root reach it: the helper serves audio.sock only while it is 3911's and 0600.
+User=root
+Environment=JAP_RIDEWATCH_AUDIO_CLIENT=3911
+# the player runs as 3911 with mgu_alsa as its one group (the smartx FIFOs are ent_alsa:mgu_alsa 0660), never as root
+Environment=JAP_RIDEWATCH_PLAYER_AS=3911:mgu_alsa
+# conn.json: the AudioManager connection in use, for the sweep below; kept between runs
+RuntimeDirectory=jap-ridewatch-audio
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment=JAP_RIDEWATCH_AUDIO_STATE=/run/jap-ridewatch-audio/conn.json
+# the mic is only lent: a lender's socket here (JAP_RIDEWATCH_MIC_LEASE=<path>, e.g. in a drop-in); none = no Talk.
+# The helper connects to it as root: a lender that admits only uid 3911 keeps everyone else out, not root.
+# someip.node is built for the unit's own Node
+ExecStart=/usr/bin/node /var/opt/jap-ridewatch/current/audio/ridewatch-audio.js
+# whatever ended the run (SIGKILL, OOM, a crash): its recorded connection disconnected, the source's availability put
+# back; no record (any clean end): it returns at once without touching AudioManager; 15 s at most
+ExecStopPost=/usr/bin/node /var/opt/jap-ridewatch/current/audio/ridewatch-audio.js --sweep
+# exits by itself 60 s after its last session; the socket starts it again
+Restart=on-failure
+RestartSec=3
+# SIGTERM: sessions ended and released, exit (4 s cap in the helper); the sweep after it: 15 s cap
+TimeoutStopSec=20
+MemoryLimit=64M
+CPUQuota=50%
+LimitCORE=1
+# hardening that leaves SOME/IP and ALSA alone: no PrivateTmp (vsomeip's local sockets are in /tmp); ProtectSystem=full,
+# not strict (strict would need /tmp writable anyway, and where vsomeip and someip.node write is not known before the car
+# test); the capabilities are left as they are (the player's drop needs setuid/setgid, SOME/IP's needs are not known)
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full

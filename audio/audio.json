@@ -1,0 +1,38 @@
+{
+ "_doc": "jap-ridewatch-audio's defaults. To change them copy this file to /var/opt/jap-ridewatch/audio.json (root's, 0644). sources: tried in order, each a smartx port and its AudioManager source id. TODO: the ids are not known yet; read every source's id, name, class and availability on the car (getListMainSources) and fill them in. A source without an id is skipped, so Listen answers nosource until then, and the service offers no Listen. A source is only used when AudioManager lists it with no connection; its availability is put back afterwards. The phone's sources (256-262, 264, 267, 268, 274, 277, 278, 291), 276, 288, 289 and the CarLifeNavigation and SpeechSink ports are refused whatever this says. player: the first command whose binary exists plays the PCM ({port}, {rate} filled in); none = no Listen. TODO: pcmio is not shipped with RideWatch and the car has no aplay; put a player at one of these paths. listenMaxS: a Listen ends after this many seconds (1-3600, default 300). The helper runs as root; the player runs as JAP_RIDEWATCH_PLAYER_AS (3911:mgu_alsa), never as root.",
+ "sources": [
+  {
+   "port": "Voip_Physical_Source_CF_24_MONO",
+   "id": null
+  },
+  {
+   "port": "Media_Overlay_Converter_Source",
+   "id": null
+  },
+  {
+   "port": "BT_Voice_Recognition_2",
+   "id": null
+  }
+ ],
+ "player": [
+  "/var/opt/jap-ridewatch/pcmio",
+  "play",
+  "plug:smartx:{port}",
+  "{rate}"
+ ],
+ "fallback": [
+  "/usr/bin/aplay",
+  "-q",
+  "-t",
+  "raw",
+  "-f",
+  "S16_LE",
+  "-c",
+  "1",
+  "-r",
+  "{rate}",
+  "-D",
+  "plug:smartx:{port}"
+ ],
+ "listenMaxS": 300
+}
