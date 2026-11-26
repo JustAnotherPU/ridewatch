@@ -2,6 +2,8 @@
 
 Your home cameras on your BMW's centre screen while the car is parked.
 
+Write-up, with the home server and the tunnel the car uses: [RideWatch on Everything Patched](https://everythingpatched.com/posts/ridewatch/).
+
 RideWatch runs on BMW iDrive 7 (MGU). One camera fills the left of the screen and the others sit live in a pane on
 the right. When something happens (a ring at the door, a person, a car, an animal, a parcel), that camera takes the
 big picture. A second tab lists the last few days of detections with a thumbnail each, and plays the clip from
